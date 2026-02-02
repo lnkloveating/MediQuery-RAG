@@ -54,3 +54,45 @@ def search_knowledge_base(query: str, k: int = 3) -> str:
     except Exception as e:
         print(f"检索出错: {e}")
         return ""
+    
+
+    # --- 4. Self-RAG 专用组件 ---
+
+def grade_document_relevance(question: str, doc_content: str) -> str:
+    """
+    阅卷老师：判断文档是否与问题相关
+    返回: 'yes' 或 'no'
+    """
+    prompt = f"""
+    你是一名评分员，负责评估检索到的文档是否与用户问题相关。
+    
+    文档内容：
+    {doc_content}
+    
+    用户问题：
+    {question}
+    
+    如果文档包含与问题相关的关键词或语义，请回答 'yes'，否则回答 'no'。
+    只输出 'yes' 或 'no'，不要有其他废话。
+    """
+    # 使用 invoke 调用模型
+    score = llm.invoke(prompt).content.strip().lower()
+    
+    # 简单的清洗逻辑
+    if "yes" in score: return "yes"
+    return "no"
+
+def rewrite_query(question: str) -> str:
+    """
+    改题专家：优化搜索关键词
+    """
+    print(f"  🔄 [Self-RAG] 正在重写查询: {question}")
+    prompt = f"""
+    你是一个搜索引擎优化专家。原问题检索不到相关信息。
+    请根据原问题，推断其背后的语义意图，并构造一个更好的搜索查询词。
+    
+    原问题：{question}
+    
+    只输出新的查询词，不要有任何解释。
+    """
+    return llm.invoke(prompt).content.strip()
