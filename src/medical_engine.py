@@ -3,12 +3,18 @@
 """
 import sys
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 # 导入工具列表，用于绑定给模型
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from tools import medical_tools_list
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
+
+from langchain_community.tools.tavily_search import TavilySearchResults
 
 # --- 1. 基础配置 ---
 DB_PATH = "./medical_db"
@@ -32,6 +38,8 @@ llm_with_tools = llm.bind_tools(medical_tools_list)
 
 # 连接数据库
 vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+
+web_search_tool = TavilySearchResults(k=3)
 
 # --- 3. 封装通用功能 ---
 

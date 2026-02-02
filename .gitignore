@@ -4,3 +4,4 @@ __pycache__/
 *.tar.zst
 medical_db/
 .vscode/
+.env
