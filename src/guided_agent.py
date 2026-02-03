@@ -1,9 +1,13 @@
 """
-科普医疗助手 - 优化版本
+科普医疗助手 - 优化版本 (Bug 已修复)
 新增功能：
 1. 长期记忆 (Store) - 永久保存用户健康档案
 2. 对话摘要 - 智能压缩历史对话，保留关键信息
 3. 健康信息提取 - 自动识别并存储用户的健康数据
+
+修复内容：
+- 修复 extract_health_info 只能提取一条信息的问题
+- 添加调试日志确认存储成功
 """
 import sys
 import os
@@ -77,6 +81,9 @@ SCIENCE_EXAMPLES = """
 MAX_MESSAGES_BEFORE_SUMMARY = 16  # 超过16条消息时触发摘要
 KEEP_RECENT_MESSAGES = 6          # 摘要后保留最近6条消息
 
+# 调试模式开关
+DEBUG_MEMORY = True  # 设置为 True 可以看到详细的存储日志
+
 # ============================================================
 # 🆕 State定义（新增字段）
 # ============================================================
@@ -103,15 +110,20 @@ class GuidedState(TypedDict):
 # ============================================================
 # 🆕 长期记忆 Store 初始化
 # ============================================================
-# 使用 InMemoryStore（生产环境建议换成 PostgresStore）
+# 使用 InMemoryStore（生产环境建议换成持久化存储）
 health_store = InMemoryStore()
 
+# 用一个简单的字典作为备选存储（防止 Store API 不兼容）
+_health_backup = {}
+
 # ============================================================
-# 🆕 健康信息提取函数
+# 🆕 健康信息提取函数 (修复版)
 # ============================================================
 def extract_health_info(user_message: str, user_id: str):
     """
     从用户消息中提取健康相关信息，存入长期记忆
+    
+    🔧 修复：支持提取多条信息（返回 JSON 数组）
     """
     extract_prompt = f"""
 分析以下用户消息，提取健康/医疗相关的个人信息。
@@ -125,101 +137,152 @@ def extract_health_info(user_message: str, user_id: str):
 4. 生活习惯：吸烟、饮酒、运动习惯等
 5. 用药情况：正在服用的药物
 
-如果消息中包含上述任何信息，返回JSON格式：
-{{"category": "类别", "content": "具体内容", "important": true/false}}
+【重要】请返回 JSON 数组格式，包含所有提取到的信息：
+[
+  {{"category": "类别1", "content": "具体内容1", "important": true/false}},
+  {{"category": "类别2", "content": "具体内容2", "important": true/false}}
+]
 
-如果没有健康相关信息，只返回：null
+如果没有健康相关信息，返回空数组：[]
 
-注意：过敏信息的 important 必须设为 true
+注意：
+- 过敏信息的 important 必须设为 true
+- 每种信息单独一条记录
+- 只返回 JSON，不要其他文字
 """
+    
+    extracted_items = []
     
     try:
         result = llm.invoke(extract_prompt).content.strip()
         
+        if DEBUG_MEMORY:
+            print(f"  🔍 [DEBUG] LLM 返回: {result[:200]}...")
+        
+        # 清理可能的 markdown 代码块
+        if "```" in result:
+            # 提取 ``` 之间的内容
+            parts = result.split("```")
+            for part in parts:
+                if "[" in part:
+                    result = part.replace("json", "").strip()
+                    break
+        
         # 尝试解析 JSON
-        if result and result != "null" and "{" in result:
-            # 清理可能的 markdown 代码块
-            if "```" in result:
-                result = result.split("```")[1].replace("json", "").strip()
+        if result and result != "null" and "[" in result:
+            info_list = json.loads(result)
             
-            info = json.loads(result)
+            if not isinstance(info_list, list):
+                # 兼容旧版本：如果返回单个对象，转为数组
+                info_list = [info_list]
             
-            if info and isinstance(info, dict) and info.get("content"):
-                # 生成唯一key
-                key = f"{info['category']}_{uuid.uuid4().hex[:8]}"
-                
-                # 存入 Store
-                health_store.put(
-                    namespace=("health", user_id),
-                    key=key,
-                    value={
+            for info in info_list:
+                if info and isinstance(info, dict) and info.get("content"):
+                    # 生成唯一key
+                    key = f"{info['category']}_{uuid.uuid4().hex[:8]}"
+                    
+                    record = {
                         "category": info["category"],
                         "content": info["content"],
                         "important": info.get("important", False),
                         "timestamp": str(uuid.uuid4())[:8]
                     }
-                )
-                print(f"  💾 [长期记忆] 已记录: [{info['category']}] {info['content']}")
-                return info
-    except json.JSONDecodeError:
-        pass
+                    
+                    # 尝试存入 Store
+                    try:
+                        health_store.put(("health", user_id), key, record)
+                    except Exception as e:
+                        if DEBUG_MEMORY:
+                            print(f"  ⚠️ [DEBUG] Store 存储失败: {e}")
+                    
+                    # 同时存入备选字典（这是主要的存储方式）
+                    if user_id not in _health_backup:
+                        _health_backup[user_id] = {}
+                    _health_backup[user_id][key] = record
+                    
+                    print(f"  💾 [长期记忆] 已记录: [{info['category']}] {info['content']}")
+                    extracted_items.append(info)
+            
+            if DEBUG_MEMORY:
+                print(f"  ✅ [DEBUG] 共提取 {len(extracted_items)} 条信息")
+                print(f"  ✅ [DEBUG] _health_backup[{user_id}] = {_health_backup.get(user_id, {})}")
+                    
+    except json.JSONDecodeError as e:
+        if DEBUG_MEMORY:
+            print(f"  ⚠️ [DEBUG] JSON 解析失败: {e}")
+            print(f"  ⚠️ [DEBUG] 原始内容: {result}")
     except Exception as e:
         print(f"  ⚠️ 健康信息提取失败: {e}")
     
-    return None
+    return extracted_items if extracted_items else None
 
 
 def load_health_profile(user_id: str) -> str:
     """
     从 Store 加载用户的健康档案
     """
+    if DEBUG_MEMORY:
+        print(f"  📋 [DEBUG] 加载用户档案: {user_id}")
+        print(f"  📋 [DEBUG] _health_backup 所有用户: {list(_health_backup.keys())}")
+    
+    items_dict = {}
+    
+    # 方法1: 尝试从 Store 读取
     try:
-        # 获取该用户的所有健康记录
-        items = health_store.search(
-            namespace=("health", user_id),
-            query="",  # 空查询返回所有
-            limit=50
-        )
-        
-        if not items:
-            return ""
-        
-        # 按类别整理
-        profile_dict = {}
-        important_items = []
-        
+        # 使用位置参数调用 search
+        items = health_store.search(("health", user_id))
         for item in items:
-            category = item.value.get("category", "其他")
-            content = item.value.get("content", "")
-            important = item.value.get("important", False)
-            
-            if category not in profile_dict:
-                profile_dict[category] = []
-            profile_dict[category].append(content)
-            
-            if important:
-                important_items.append(f"⚠️ {content}")
-        
-        # 格式化输出
-        lines = []
-        
-        # 重要信息优先显示
-        if important_items:
-            lines.append("【⚠️ 重要提醒】")
-            lines.extend(important_items)
-            lines.append("")
-        
-        # 其他信息
-        for category, contents in profile_dict.items():
-            lines.append(f"【{category}】")
-            for c in contents:
-                lines.append(f"  • {c}")
-        
-        return "\n".join(lines)
-        
+            items_dict[item.key] = item.value
     except Exception as e:
-        print(f"  ⚠️ 加载健康档案失败: {e}")
+        if DEBUG_MEMORY:
+            print(f"  ⚠️ [DEBUG] Store 读取失败: {e}")
+    
+    # 方法2: 从备选字典读取（主要方式）
+    if user_id in _health_backup:
+        for key, value in _health_backup[user_id].items():
+            if key not in items_dict:
+                items_dict[key] = value
+        if DEBUG_MEMORY:
+            print(f"  ✅ [DEBUG] 从 _health_backup 读取到 {len(_health_backup[user_id])} 条记录")
+    else:
+        if DEBUG_MEMORY:
+            print(f"  ⚠️ [DEBUG] 用户 {user_id} 不在 _health_backup 中")
+    
+    if not items_dict:
         return ""
+    
+    # 按类别整理
+    profile_dict = {}
+    important_items = []
+    
+    for key, value in items_dict.items():
+        category = value.get("category", "其他")
+        content = value.get("content", "")
+        important = value.get("important", False)
+        
+        if category not in profile_dict:
+            profile_dict[category] = []
+        profile_dict[category].append(content)
+        
+        if important:
+            important_items.append(f"⚠️ {content}")
+    
+    # 格式化输出
+    lines = []
+    
+    # 重要信息优先显示
+    if important_items:
+        lines.append("【⚠️ 重要提醒】")
+        lines.extend(important_items)
+        lines.append("")
+    
+    # 其他信息
+    for category, contents in profile_dict.items():
+        lines.append(f"【{category}】")
+        for c in contents:
+            lines.append(f"  • {c}")
+    
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -332,6 +395,8 @@ def router_node(state: GuidedState):
     question = messages[-1].content
     
     print(f"\n🧭 [智能路由]")
+    if DEBUG_MEMORY:
+        print(f"  🔑 [DEBUG] user_id = {user_id}")
     
     # 🆕 Step 1: 提取并存储健康信息
     extract_health_info(question, user_id)
@@ -649,10 +714,18 @@ def show_health_profile(user_id: str):
 def clear_health_profile(user_id: str):
     """清空用户健康档案"""
     try:
-        # InMemoryStore 没有直接的 delete_all，需要逐个删除
-        items = health_store.search(namespace=("health", user_id), query="", limit=100)
-        for item in items:
-            health_store.delete(namespace=("health", user_id), key=item.key)
+        # 清空 Store
+        try:
+            items = health_store.search(("health", user_id))
+            for item in items:
+                health_store.delete(("health", user_id), item.key)
+        except Exception:
+            pass
+        
+        # 清空备选字典
+        if user_id in _health_backup:
+            _health_backup[user_id] = {}
+        
         print("  ✓ 健康档案已清空")
     except Exception as e:
         print(f"  ⚠️ 清空失败: {e}")
@@ -674,6 +747,7 @@ def show_mode_menu():
      /profile  - 查看我记住的你的健康信息
      /clear    - 清空健康档案
      /new      - 开始新会话
+     /debug    - 开启/关闭调试模式
   
 输入 1 或 2 选择模式，或直接输入问题：
 """)
@@ -739,6 +813,12 @@ if __name__ == "__main__":
                 confirm = input("⚠️ 确定要清空健康档案吗？(y/n): ").strip().lower()
                 if confirm == "y":
                     clear_health_profile(user_id)
+                continue
+            
+            # 🆕 新命令：调试模式
+            if user_input == "/debug":
+                DEBUG_MEMORY = not DEBUG_MEMORY
+                print(f"  调试模式: {'开启' if DEBUG_MEMORY else '关闭'}")
                 continue
             
             if user_input == "/new":
