@@ -227,11 +227,13 @@ def run_health_advisor(app) -> str:
             if answer.lower() in ['q', '/q']:
                 print("\n⚠️  问诊已中断，您的信息已保存。")
                 consultation.save_session()
+                consultation.generate_history_markdown()
                 return "back_to_menu"
             
             if answer.lower() in ['qq', '/qq']:
                 print("\n👋 再见！您的信息已保存。")
                 consultation.save_session()
+                consultation.generate_history_markdown()
                 return "exit_program"
             
             if not answer:
@@ -253,6 +255,7 @@ def run_health_advisor(app) -> str:
             print("  ⚠️  本次咨询已结束，请立即就医！")
             print("!" * 58)
             consultation.save_session()
+            consultation.generate_history_markdown()
             input("\n按回车键返回主菜单...")
             return "back_to_menu"
         
@@ -340,12 +343,14 @@ def run_health_advisor(app) -> str:
                 print(f"⚠️  生成建议时出错: {e}")
     
     # 生成Markdown历史
-    consultation.generate_history_markdown()
+    md_path = consultation.generate_history_markdown()
     
     print()
     print("=" * 58)
     print(f"📄 问诊记录已保存")
     print(f"   档案位置: user_data/{user.user_id[:8]}...")
+    if md_path:
+        print(f"   历史文档: history.md ✅")
     print("=" * 58)
     
     input("\n按回车键返回主菜单...")
