@@ -15,6 +15,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import trim_messages, SystemMessage
 
 # 导入模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
