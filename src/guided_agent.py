@@ -1,17 +1,21 @@
 """
-科普医疗助手 - 双模式版本
-模式1: 健康评估（引导式输入）
-模式2: 医学科普（自由问答）
+科普医疗助手 - 优化版本
+新增功能：
+1. 长期记忆 (Store) - 永久保存用户健康档案
+2. 对话摘要 - 智能压缩历史对话，保留关键信息
+3. 健康信息提取 - 自动识别并存储用户的健康数据
 """
 import sys
 import os
 import uuid
-from typing import Annotated, TypedDict, List
+import json
+from typing import Annotated, TypedDict, List, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.memory import InMemoryStore
 import sqlite3
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, RemoveMessage
 
 # 导入模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -26,11 +30,14 @@ except ImportError:
 # --- 配置 ---
 WELCOME_MESSAGE = """
 ╔════════════════════════════════════════════════════════════╗
-║                🏥 科普医疗智能助手                          ║
+║                🏥 科普医疗智能助手 (优化版)                  ║
 ║                                                            ║
 ║  我可以帮你：                                               ║
 ║  1  【健康评估】计算BMI、血压评估、热量需求等                  ║
 ║  2  【医学科普】疾病预防、症状解读、生活建议等                 ║
+║                                                            ║
+║  🆕 新功能：我现在能记住你的健康信息了！                       ║
+║     告诉我你的身高体重、过敏史等，下次我会记得                  ║
 ║                                                            ║
 ║  💡 提示：我的知识来自《超越百岁》医学书籍及网络搜索           ║
 ║  ⚠️  注意：建议仅供参考，不能替代专业医疗诊断！               ║
@@ -54,28 +61,29 @@ SCIENCE_EXAMPLES = """
 🩺 疾病预防：
   • "如何预防糖尿病？"
   • "怎样降低心脏病风险？"
-  • "预防阿尔茨海默病的方法？"
 
 🏃 运动健康：
   • "什么是二区训练？"
   • "运动对健康有什么好处？"
-  • "如何科学减肥？"
 
 🍎 饮食营养：
   • "糖尿病患者怎么吃？"
   • "高血压要注意什么饮食？"
-  • "果糖为什么会引发疾病？"
-
-😴 睡眠与健康：
-  • "睡眠不好有什么危害？"
-  • "如何改善睡眠质量？"
-  • "深度睡眠有什么作用？"
 """
 
-# --- State定义 ---
+# ============================================================
+# 🆕 记忆配置
+# ============================================================
+MAX_MESSAGES_BEFORE_SUMMARY = 16  # 超过16条消息时触发摘要
+KEEP_RECENT_MESSAGES = 6          # 摘要后保留最近6条消息
+
+# ============================================================
+# 🆕 State定义（新增字段）
+# ============================================================
 class GuidedState(TypedDict):
     messages: Annotated[list, add_messages]
     mode: str  # "assessment" | "science" | None
+    user_id: str  # 🆕 用户标识
     need_tool: bool
     need_rag: bool
     need_web: bool
@@ -87,20 +95,194 @@ class GuidedState(TypedDict):
     documents: List[str]
     loop_step: int
     used_web_search: bool
+    
+    # 🆕 记忆相关
+    health_profile: str      # 用户健康档案（从Store加载）
+    summary: str             # 历史对话摘要
 
-# --- 辅助函数 ---
+# ============================================================
+# 🆕 长期记忆 Store 初始化
+# ============================================================
+# 使用 InMemoryStore（生产环境建议换成 PostgresStore）
+health_store = InMemoryStore()
 
+# ============================================================
+# 🆕 健康信息提取函数
+# ============================================================
+def extract_health_info(user_message: str, user_id: str):
+    """
+    从用户消息中提取健康相关信息，存入长期记忆
+    """
+    extract_prompt = f"""
+分析以下用户消息，提取健康/医疗相关的个人信息。
+
+用户消息："{user_message}"
+
+需要提取的信息类型：
+1. 身体指标：身高、体重、年龄、性别、血压、血糖等
+2. 过敏信息：药物过敏、食物过敏等（非常重要！）
+3. 疾病史：糖尿病、高血压、心脏病等慢性病
+4. 生活习惯：吸烟、饮酒、运动习惯等
+5. 用药情况：正在服用的药物
+
+如果消息中包含上述任何信息，返回JSON格式：
+{{"category": "类别", "content": "具体内容", "important": true/false}}
+
+如果没有健康相关信息，只返回：null
+
+注意：过敏信息的 important 必须设为 true
+"""
+    
+    try:
+        result = llm.invoke(extract_prompt).content.strip()
+        
+        # 尝试解析 JSON
+        if result and result != "null" and "{" in result:
+            # 清理可能的 markdown 代码块
+            if "```" in result:
+                result = result.split("```")[1].replace("json", "").strip()
+            
+            info = json.loads(result)
+            
+            if info and isinstance(info, dict) and info.get("content"):
+                # 生成唯一key
+                key = f"{info['category']}_{uuid.uuid4().hex[:8]}"
+                
+                # 存入 Store
+                health_store.put(
+                    namespace=("health", user_id),
+                    key=key,
+                    value={
+                        "category": info["category"],
+                        "content": info["content"],
+                        "important": info.get("important", False),
+                        "timestamp": str(uuid.uuid4())[:8]
+                    }
+                )
+                print(f"  💾 [长期记忆] 已记录: [{info['category']}] {info['content']}")
+                return info
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        print(f"  ⚠️ 健康信息提取失败: {e}")
+    
+    return None
+
+
+def load_health_profile(user_id: str) -> str:
+    """
+    从 Store 加载用户的健康档案
+    """
+    try:
+        # 获取该用户的所有健康记录
+        items = health_store.search(
+            namespace=("health", user_id),
+            query="",  # 空查询返回所有
+            limit=50
+        )
+        
+        if not items:
+            return ""
+        
+        # 按类别整理
+        profile_dict = {}
+        important_items = []
+        
+        for item in items:
+            category = item.value.get("category", "其他")
+            content = item.value.get("content", "")
+            important = item.value.get("important", False)
+            
+            if category not in profile_dict:
+                profile_dict[category] = []
+            profile_dict[category].append(content)
+            
+            if important:
+                important_items.append(f"⚠️ {content}")
+        
+        # 格式化输出
+        lines = []
+        
+        # 重要信息优先显示
+        if important_items:
+            lines.append("【⚠️ 重要提醒】")
+            lines.extend(important_items)
+            lines.append("")
+        
+        # 其他信息
+        for category, contents in profile_dict.items():
+            lines.append(f"【{category}】")
+            for c in contents:
+                lines.append(f"  • {c}")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        print(f"  ⚠️ 加载健康档案失败: {e}")
+        return ""
+
+
+# ============================================================
+# 🆕 对话摘要函数
+# ============================================================
+def summarize_old_messages(messages: list, user_id: str) -> tuple[str, list]:
+    """
+    当对话过长时，将旧消息压缩成摘要
+    返回：(摘要文本, 保留的最近消息)
+    """
+    if len(messages) <= MAX_MESSAGES_BEFORE_SUMMARY:
+        return "", messages  # 不需要摘要
+    
+    print(f"  📝 [对话摘要] 消息数 {len(messages)} 超过阈值，正在压缩...")
+    
+    # 分离：需要摘要的旧消息 vs 保留的新消息
+    old_messages = messages[:-KEEP_RECENT_MESSAGES]
+    recent_messages = messages[-KEEP_RECENT_MESSAGES:]
+    
+    # 构建摘要 prompt
+    conversation_text = []
+    for msg in old_messages:
+        if hasattr(msg, 'content') and msg.content:
+            role = "用户" if isinstance(msg, HumanMessage) else "助手"
+            # 截断过长的单条消息
+            content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+            conversation_text.append(f"{role}: {content}")
+    
+    summary_prompt = f"""
+请总结以下对话的关键信息，重点提取：
+
+1. 用户提到的身体指标（身高、体重、血压等具体数值）
+2. 用户的健康状况（疾病、过敏、症状）
+3. 用户的主要问题和关注点
+4. 助手给出的重要建议
+
+对话内容：
+{chr(10).join(conversation_text)}
+
+请用简洁的要点形式总结（不超过300字），保留所有具体数值和重要健康信息：
+"""
+    
+    try:
+        summary = llm.invoke(summary_prompt).content.strip()
+        print(f"  ✓ 摘要生成完成，压缩了 {len(old_messages)} 条消息")
+        return summary, recent_messages
+    except Exception as e:
+        print(f"  ⚠️ 摘要生成失败: {e}")
+        # 失败时简单截断
+        return "", recent_messages
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
 def detect_mode(user_input: str) -> str:
     """智能检测用户意图"""
     keywords_assessment = ["计算", "评估", "BMI", "血压", "体重", "身高", "热量", "心率", "kg", "cm"]
     keywords_science = ["预防", "什么是", "为什么", "怎么", "如何", "有什么", "原因", "作用", "好处"]
     
     input_lower = user_input.lower()
-    
-    # 检测数字（通常是计算类问题）
     has_numbers = any(char.isdigit() for char in user_input)
     
-    # 关键词匹配
     assessment_score = sum(1 for kw in keywords_assessment if kw in input_lower)
     science_score = sum(1 for kw in keywords_science if kw in input_lower)
     
@@ -109,7 +291,7 @@ def detect_mode(user_input: str) -> str:
     elif science_score > 0:
         return "science"
     else:
-        return "science"  # 默认科普模式
+        return "science"
 
 
 def grade_documents(question: str, docs: List[str]) -> str:
@@ -138,28 +320,47 @@ def rewrite_query(question: str) -> str:
     """
     return llm.invoke(prompt).content.strip()
 
-# --- 节点定义 ---
+
+# ============================================================
+# 节点定义（已优化）
+# ============================================================
 
 def router_node(state: GuidedState):
-    """路由节点"""
-    question = state["messages"][-1].content
+    """路由节点 - 🆕 增加记忆处理"""
+    messages = state["messages"]
+    user_id = state.get("user_id", "anonymous")
+    question = messages[-1].content
+    
+    print(f"\n🧭 [智能路由]")
+    
+    # 🆕 Step 1: 提取并存储健康信息
+    extract_health_info(question, user_id)
+    
+    # 🆕 Step 2: 加载用户健康档案
+    health_profile = load_health_profile(user_id)
+    if health_profile:
+        print(f"  📋 已加载用户健康档案")
+    
+    # 🆕 Step 3: 检查是否需要摘要压缩
+    summary = ""
+    if len(messages) > MAX_MESSAGES_BEFORE_SUMMARY:
+        summary, messages = summarize_old_messages(messages, user_id)
     
     # 智能检测模式
     mode = detect_mode(question)
-    
-    print(f"\n🧭 [智能路由]")
     print(f"  检测到模式: {'🔢 健康评估' if mode == 'assessment' else '📖 医学科普'}")
     
-    # 判断需要什么
     if mode == "assessment":
         return {
             "mode": "assessment",
             "need_tool": True,
-            "need_rag": True,  # 评估后也给建议
+            "need_rag": True,
             "need_web": False,
             "loop_step": 0,
             "documents": [],
-            "used_web_search": False
+            "used_web_search": False,
+            "health_profile": health_profile,  # 🆕
+            "summary": summary                  # 🆕
         }
     else:
         return {
@@ -169,7 +370,9 @@ def router_node(state: GuidedState):
             "need_web": False,
             "loop_step": 0,
             "documents": [],
-            "used_web_search": False
+            "used_web_search": False,
+            "health_profile": health_profile,  # 🆕
+            "summary": summary                  # 🆕
         }
 
 
@@ -204,7 +407,6 @@ def retrieve_node(state: GuidedState):
     print("📚 [知识库检索]")
     question = state["messages"][-1].content
     
-    # 如果是评估模式，加上工具结果一起检索
     if state.get("tool_output"):
         search_query = f"{question} 健康建议"
     else:
@@ -234,66 +436,84 @@ def web_search_node(state: GuidedState):
 
 
 def grade_and_generate_node(state: GuidedState):
-    """评分与生成节点"""
+    """评分与生成节点 - 🆕 注入健康档案和摘要"""
     question = state["messages"][-1].content
     docs = state["documents"]
     mode = state.get("mode", "science")
+    
+    # 🆕 获取记忆信息
+    health_profile = state.get("health_profile", "")
+    summary = state.get("summary", "")
     
     # 评分
     score = grade_documents(question, docs)
     print(f"  评分: {'✓ 相关' if score == 'yes' else '✗ 不相关'}")
     
     if score == "yes":
-        # 生成答案
         print("💡 [生成答案]")
         context = "\n\n".join(docs)
         source_tag = "(来源: 互联网)" if state["used_web_search"] else "(来源: 医学知识库)"
         
+        # 🆕 构建记忆上下文
+        memory_context = ""
+        if health_profile:
+            memory_context += f"""
+【⚠️ 用户健康档案 - 请务必参考】
+{health_profile}
+"""
+        if summary:
+            memory_context += f"""
+【历史对话摘要】
+{summary}
+"""
+        
         if mode == "assessment":
-            # 评估模式：结合计算结果给建议
             tool_result = state.get("tool_output", "")
             prompt = f"""
-            你是专业的健康顾问。根据计算结果和医学知识，给出建议。
-            
-            【健康评估结果】
-            {tool_result}
-            
-            【医学知识参考】{source_tag}
-            {context}
-            
-            【用户问题】
-            {question}
-            
-            请给出：
-            1. 结果解读（通俗易懂）
-            2. 健康建议（具体可行）
-            3. 注意事项
-            
-            语气要专业但亲切，像医生和朋友的结合。
-            """
+你是专业的健康顾问。根据计算结果和医学知识，给出个性化建议。
+
+{memory_context}
+
+【健康评估结果】
+{tool_result}
+
+【医学知识参考】{source_tag}
+{context}
+
+【用户问题】
+{question}
+
+请给出：
+1. 结果解读（通俗易懂）
+2. 健康建议（具体可行，需考虑用户的健康档案）
+3. 注意事项（特别注意用户的过敏史和疾病史！）
+
+语气要专业但亲切，像医生和朋友的结合。
+"""
         else:
-            # 科普模式：清晰解释
             prompt = f"""
-            你是医学科普专家。用通俗易懂的语言解释医学知识。
-            
-            【医学知识】{source_tag}
-            {context}
-            
-            【问题】
-            {question}
-            
-            要求：
-            1. 先简单回答（2-3句话）
-            2. 如有必要，展开详细解释
-            3. 给出实用建议
-            4. 语言通俗，不要太多专业术语
-            """
+你是医学科普专家。用通俗易懂的语言解释医学知识。
+
+{memory_context}
+
+【医学知识】{source_tag}
+{context}
+
+【问题】
+{question}
+
+要求：
+1. 先简单回答（2-3句话）
+2. 如有必要，展开详细解释
+3. 给出实用建议（需考虑用户的健康档案，如有）
+4. 如果用户有特殊情况（过敏、疾病），要特别提醒
+5. 语言通俗，不要太多专业术语
+"""
         
         answer = llm.invoke(prompt).content
         return {"rag_output": answer, "final_answer": "ready"}
     
     elif state["loop_step"] >= 3:
-        # 超过重试次数
         if not state["used_web_search"]:
             print("  ⚠️ 本地搜索失败，转入联网搜索")
             return {"final_answer": "go_web"}
@@ -304,7 +524,6 @@ def grade_and_generate_node(state: GuidedState):
             answer = llm.invoke(prompt).content
             return {"rag_output": answer, "final_answer": "ready"}
     else:
-        # 重写查询
         print("  🔄 优化搜索词，重新检索...")
         new_query = rewrite_query(question)
         return {"messages": [HumanMessage(content=new_query)]}
@@ -315,9 +534,14 @@ def summarizer_node(state: GuidedState):
     mode = state.get("mode", "science")
     tool_output = state.get("tool_output", "")
     rag_output = state.get("rag_output", "")
+    health_profile = state.get("health_profile", "")
+    
+    # 🆕 如果有健康档案，添加提示
+    profile_note = ""
+    if health_profile:
+        profile_note = "\n📋 已参考你的健康档案生成个性化建议"
     
     if mode == "assessment" and tool_output:
-        # 评估模式：结构化输出
         final_text = f"""
 ╔═══════════════════════════════════════════════════════════╗
 ║                    🔢 健康评估结果                        ║
@@ -329,6 +553,7 @@ def summarizer_node(state: GuidedState):
 
 📖 【医学建议】
 {rag_output if rag_output else '暂无额外建议'}
+{profile_note}
 
 {'─' * 60}
 
@@ -337,13 +562,13 @@ def summarizer_node(state: GuidedState):
 如有健康问题，请咨询专业医生。
 """
     else:
-        # 科普模式：简洁输出
         final_text = f"""
 ╔═══════════════════════════════════════════════════════════╗
 ║                    📖 医学科普解答                         ║
 ╚═══════════════════════════════════════════════════════════╝
 
 {rag_output if rag_output else '抱歉，暂时无法找到相关信息。'}
+{profile_note}
 
 {'─' * 60}
 
@@ -354,7 +579,10 @@ def summarizer_node(state: GuidedState):
     
     return {"final_answer": final_text, "messages": [AIMessage(content=final_text)]}
 
-# --- 构建图 ---
+
+# ============================================================
+# 构建图
+# ============================================================
 workflow = StateGraph(GuidedState)
 
 workflow.add_node("router", router_node)
@@ -392,14 +620,48 @@ workflow.add_conditional_edges("grade_loop", route_self_rag,
 workflow.add_edge("web_search", "grade_loop")
 workflow.add_edge("summarizer", END)
 
-# --- 编译 ---
+# ============================================================
+# 编译
+# ============================================================
 conn = sqlite3.connect("chat_history.db", check_same_thread=False)
 memory = SqliteSaver(conn)
 app = workflow.compile(checkpointer=memory)
 
-# --- 交互式菜单 ---
+
+# ============================================================
+# 🆕 调试命令
+# ============================================================
+def show_health_profile(user_id: str):
+    """显示用户健康档案"""
+    profile = load_health_profile(user_id)
+    if profile:
+        print(f"""
+╔═══════════════════════════════════════════════════════════╗
+║                    📋 你的健康档案                         ║
+╚═══════════════════════════════════════════════════════════╝
+
+{profile}
+""")
+    else:
+        print("\n📋 你的健康档案为空。告诉我你的身高体重、过敏史等信息，我会记住的！\n")
+
+
+def clear_health_profile(user_id: str):
+    """清空用户健康档案"""
+    try:
+        # InMemoryStore 没有直接的 delete_all，需要逐个删除
+        items = health_store.search(namespace=("health", user_id), query="", limit=100)
+        for item in items:
+            health_store.delete(namespace=("health", user_id), key=item.key)
+        print("  ✓ 健康档案已清空")
+    except Exception as e:
+        print(f"  ⚠️ 清空失败: {e}")
+
+
+# ============================================================
+# 交互式菜单
+# ============================================================
 def show_mode_menu():
-    """显示模式选择菜单"""
     print("""
 请选择使用模式：
 
@@ -408,57 +670,83 @@ def show_mode_menu():
   
   💡 或者直接提问，系统会自动识别！
   
+  🆕 新命令：
+     /profile  - 查看我记住的你的健康信息
+     /clear    - 清空健康档案
+     /new      - 开始新会话
+  
 输入 1 或 2 选择模式，或直接输入问题：
 """)
 
 def show_assessment_guide():
-    """显示评估引导"""
     print(ASSESSMENT_TOOLS)
     print("\n请输入你的问题（或输入 /back 返回）：")
 
 def show_science_guide():
-    """显示科普引导"""
     print(SCIENCE_EXAMPLES)
     print("\n请输入你的问题（或输入 /back 返回）：")
 
-# --- 运行 ---
+
+# ============================================================
+# 运行
+# ============================================================
 if __name__ == "__main__":
-    # 欢迎界面
     print(WELCOME_MESSAGE)
     
-    # API密钥检查
     if not os.environ.get("TAVILY_API_KEY"):
         print("⚠️  提示: 未配置 TAVILY_API_KEY，联网搜索将不可用")
         print("   如需使用，请访问 https://tavily.com 获取API密钥\n")
     
-    # 会话管理
-    user_id = input("👤 输入你的名字（或按Enter使用临时会话）: ").strip()
-    thread_id = user_id if user_id else str(uuid.uuid4())
+    # 🆕 会话管理（user_id 用于长期记忆）
+    user_id = input("👤 输入你的名字（用于记住你的健康信息，或按Enter匿名）: ").strip()
+    if not user_id:
+        user_id = f"anon_{uuid.uuid4().hex[:8]}"
+    
+    thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"  # 每次新会话
     config = {"configurable": {"thread_id": thread_id}}
     
-    print(f"\n✨ 会话已建立: {thread_id}")
+    print(f"\n✨ 欢迎，{user_id}！")
+    print(f"   会话ID: {thread_id}")
+    
+    # 🆕 检查是否有历史健康档案
+    existing_profile = load_health_profile(user_id)
+    if existing_profile:
+        print(f"   📋 已加载你的健康档案（输入 /profile 查看）")
+    
     print("━" * 60)
     
-    current_mode = None  # None | "assessment" | "science"
+    current_mode = None
     
     while True:
         try:
-            # 根据状态显示不同菜单
             if current_mode is None:
                 show_mode_menu()
             
             user_input = input("👉 ").strip()
             
-            # 特殊命令
+            # 退出
             if user_input.lower() in ["q", "quit", "exit"]:
-                print("\n👋 再见！祝你健康！")
+                print("\n👋 再见！你的健康信息已保存，下次见！")
                 break
             
+            # 🆕 新命令：查看健康档案
+            if user_input == "/profile":
+                show_health_profile(user_id)
+                continue
+            
+            # 🆕 新命令：清空健康档案
+            if user_input == "/clear":
+                confirm = input("⚠️ 确定要清空健康档案吗？(y/n): ").strip().lower()
+                if confirm == "y":
+                    clear_health_profile(user_id)
+                continue
+            
             if user_input == "/new":
-                thread_id = str(uuid.uuid4())
+                thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
                 config = {"configurable": {"thread_id": thread_id}}
                 current_mode = None
-                print(f"✨ 新会话: {thread_id}\n")
+                print(f"✨ 新会话: {thread_id}")
+                print("   📋 健康档案已保留\n")
                 continue
             
             if user_input == "/back":
@@ -468,7 +756,6 @@ if __name__ == "__main__":
             if not user_input:
                 continue
             
-            # 模式选择
             if user_input == "1":
                 current_mode = "assessment"
                 show_assessment_guide()
@@ -483,7 +770,10 @@ if __name__ == "__main__":
             
             final_res = None
             for event in app.stream(
-                {"messages": [HumanMessage(content=user_input)]},
+                {
+                    "messages": [HumanMessage(content=user_input)],
+                    "user_id": user_id  # 🆕 传入 user_id
+                },
                 config
             ):
                 if "summarizer" in event:
@@ -493,8 +783,6 @@ if __name__ == "__main__":
                 print(final_res)
             
             print("\n" + "━" * 60)
-            
-            # 继续提问提示
             print("\n💬 继续提问，或输入 /back 返回主菜单")
             
         except KeyboardInterrupt:
@@ -502,4 +790,6 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"\n❌ 出错了: {e}")
+            import traceback
+            traceback.print_exc()
             print("请重新输入或输入 /back 返回主菜单\n")
