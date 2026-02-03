@@ -1,25 +1,26 @@
 """
-科普医疗助手 - 优化版本 (Bug 已修复)
-新增功能：
-1. 长期记忆 (Store) - 永久保存用户健康档案
-2. 对话摘要 - 智能压缩历史对话，保留关键信息
-3. 健康信息提取 - 自动识别并存储用户的健康数据
+科普医疗助手 - 持久化记忆版本
+核心功能：
+1. 持久化记忆 - 使用 SQLite 保存用户健康档案，关闭终端后不会丢失
+2. 用户ID系统 - 新用户自动生成ID，老用户输入ID直接恢复记忆
+3. 对话摘要 - 智能压缩历史对话，保留关键信息
+4. 健康信息提取 - 自动识别并存储用户的健康数据
 
-修复内容：
-- 修复 extract_health_info 只能提取一条信息的问题
-- 添加调试日志确认存储成功
+使用方式：
+- 新用户：直接按 Enter，输入名字，系统自动生成 ID（如 zhang_a8f3b2c1）
+- 老用户：输入之前的 ID，直接恢复所有记忆
 """
 import sys
 import os
 import uuid
 import json
+import sqlite3
+from datetime import datetime
 from typing import Annotated, TypedDict, List, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.store.memory import InMemoryStore
-import sqlite3
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, RemoveMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 # 导入模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -34,63 +35,265 @@ except ImportError:
 # --- 配置 ---
 WELCOME_MESSAGE = """
 ╔════════════════════════════════════════════════════════════╗
-║                🏥 科普医疗智能助手 (优化版)                  ║
+║                🏥 科普医疗智能助手 (持久化版)                ║
 ║                                                            ║
 ║  我可以帮你：                                               ║
 ║  1  【健康评估】计算BMI、血压评估、热量需求等                  ║
 ║  2  【医学科普】疾病预防、症状解读、生活建议等                 ║
 ║                                                            ║
-║  🆕 新功能：我现在能记住你的健康信息了！                       ║
-║     告诉我你的身高体重、过敏史等，下次我会记得                  ║
+║  🆕 持久化记忆：关闭终端后，你的健康信息不会丢失！             ║
+║     • 新用户：按 Enter，输入名字，获得专属ID                  ║
+║     • 老用户：输入ID，立即恢复所有记忆                        ║
 ║                                                            ║
 ║  💡 提示：我的知识来自《超越百岁》医学书籍及网络搜索           ║
 ║  ⚠️  注意：建议仅供参考，不能替代专业医疗诊断！               ║
 ╚════════════════════════════════════════════════════════════╝
 """
 
-# 健康评估工具说明
-ASSESSMENT_TOOLS = """
-可用的健康评估工具：
-
- 基础指标：
-  1. BMI计算 - 需要：身高(cm)、体重(kg)
-  2. 血压评估 - 需要：收缩压、舒张压
-  3. 理想体重 - 需要：身高(cm)、性别
-"""
-
-# 科普示例问题
-SCIENCE_EXAMPLES = """
-医学科普示例问题：
-
-🩺 疾病预防：
-  • "如何预防糖尿病？"
-  • "怎样降低心脏病风险？"
-
-🏃 运动健康：
-  • "什么是二区训练？"
-  • "运动对健康有什么好处？"
-
-🍎 饮食营养：
-  • "糖尿病患者怎么吃？"
-  • "高血压要注意什么饮食？"
-"""
+# ============================================================
+# 数据库配置
+# ============================================================
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_memory.db")
 
 # ============================================================
-# 🆕 记忆配置
+# 持久化存储类
 # ============================================================
-MAX_MESSAGES_BEFORE_SUMMARY = 16  # 超过16条消息时触发摘要
-KEEP_RECENT_MESSAGES = 6          # 摘要后保留最近6条消息
+class PersistentHealthStore:
+    """
+    使用 SQLite 持久化存储用户健康档案
+    """
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """初始化数据库表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 用户表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 健康档案表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS health_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                important INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        
+        # 对话摘要表（可选，用于跨会话保留重要对话上下文）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def user_exists(self, user_id: str) -> bool:
+        """检查用户是否存在"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+    
+    def create_user(self, user_id: str, display_name: str) -> bool:
+        """创建新用户"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (user_id, display_name) VALUES (?, ?)",
+                (user_id, display_name)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    
+    def update_last_active(self, user_id: str):
+        """更新用户最后活跃时间"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (user_id,)
+        )
+        conn.commit()
+        conn.close()
+    
+    def get_user_info(self, user_id: str) -> Optional[dict]:
+        """获取用户信息"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id, display_name, created_at, last_active FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                "user_id": row[0],
+                "display_name": row[1],
+                "created_at": row[2],
+                "last_active": row[3]
+            }
+        return None
+    
+    def add_health_record(self, user_id: str, category: str, content: str, important: bool = False):
+        """添加健康记录"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 检查是否已存在相同内容（避免重复）
+        cursor.execute(
+            "SELECT 1 FROM health_records WHERE user_id = ? AND category = ? AND content = ?",
+            (user_id, category, content)
+        )
+        if cursor.fetchone():
+            conn.close()
+            return False  # 已存在
+        
+        cursor.execute(
+            "INSERT INTO health_records (user_id, category, content, important) VALUES (?, ?, ?, ?)",
+            (user_id, category, content, 1 if important else 0)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_health_records(self, user_id: str) -> List[dict]:
+        """获取用户所有健康记录"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT category, content, important, created_at FROM health_records WHERE user_id = ? ORDER BY important DESC, created_at DESC",
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "category": row[0],
+                "content": row[1],
+                "important": bool(row[2]),
+                "created_at": row[3]
+            }
+            for row in rows
+        ]
+    
+    def clear_health_records(self, user_id: str):
+        """清空用户健康记录"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM health_records WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+    
+    def delete_user(self, user_id: str):
+        """删除用户及其所有数据"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM health_records WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM conversation_summaries WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+    
+    def list_all_users(self) -> List[dict]:
+        """列出所有用户（用于调试）"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, display_name, last_active FROM users ORDER BY last_active DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {"user_id": row[0], "display_name": row[1], "last_active": row[2]}
+            for row in rows
+        ]
+    
+    def save_conversation_summary(self, user_id: str, thread_id: str, summary: str):
+        """保存对话摘要"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO conversation_summaries (user_id, thread_id, summary) VALUES (?, ?, ?)",
+            (user_id, thread_id, summary)
+        )
+        conn.commit()
+        conn.close()
+    
+    def get_recent_summaries(self, user_id: str, limit: int = 3) -> List[str]:
+        """获取最近的对话摘要"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT summary FROM conversation_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in rows]
 
-# 调试模式开关
-DEBUG_MEMORY = True  # 设置为 True 可以看到详细的存储日志
+
+# 初始化全局存储
+health_store = PersistentHealthStore(DB_PATH)
 
 # ============================================================
-# 🆕 State定义（新增字段）
+# 记忆配置
+# ============================================================
+MAX_MESSAGES_BEFORE_SUMMARY = 16
+KEEP_RECENT_MESSAGES = 6
+DEBUG_MEMORY = False  # 设置为 True 开启调试日志
+
+# 全局变量用于在节点间传递 thread_id
+_current_thread_id = ""
+
+def toggle_debug_mode():
+    """切换调试模式"""
+    global DEBUG_MEMORY
+    DEBUG_MEMORY = not DEBUG_MEMORY
+    print(f"  调试模式: {'开启' if DEBUG_MEMORY else '关闭'}")
+
+def set_current_thread_id(thread_id: str):
+    """设置当前线程ID"""
+    global _current_thread_id
+    _current_thread_id = thread_id
+
+# ============================================================
+# State定义
 # ============================================================
 class GuidedState(TypedDict):
     messages: Annotated[list, add_messages]
-    mode: str  # "assessment" | "science" | None
-    user_id: str  # 🆕 用户标识
+    mode: str
+    user_id: str
     need_tool: bool
     need_rag: bool
     need_web: bool
@@ -103,27 +306,15 @@ class GuidedState(TypedDict):
     loop_step: int
     used_web_search: bool
     
-    # 🆕 记忆相关
-    health_profile: str      # 用户健康档案（从Store加载）
-    summary: str             # 历史对话摘要
+    health_profile: str
+    summary: str
 
 # ============================================================
-# 🆕 长期记忆 Store 初始化
+# 健康信息提取函数
 # ============================================================
-# 使用 InMemoryStore（生产环境建议换成持久化存储）
-health_store = InMemoryStore()
-
-# 用一个简单的字典作为备选存储（防止 Store API 不兼容）
-_health_backup = {}
-
-# ============================================================
-# 🆕 健康信息提取函数 (修复版)
-# ============================================================
-def extract_health_info(user_message: str, user_id: str):
+def extract_health_info(user_message: str, user_id: str) -> List[dict]:
     """
-    从用户消息中提取健康相关信息，存入长期记忆
-    
-    🔧 修复：支持提取多条信息（返回 JSON 数组）
+    从用户消息中提取健康相关信息，存入持久化数据库
     """
     extract_prompt = f"""
 分析以下用户消息，提取健康/医疗相关的个人信息。
@@ -147,6 +338,7 @@ def extract_health_info(user_message: str, user_id: str):
 
 注意：
 - 过敏信息的 important 必须设为 true
+- 疾病史的 important 设为 true
 - 每种信息单独一条记录
 - 只返回 JSON，不要其他文字
 """
@@ -159,106 +351,64 @@ def extract_health_info(user_message: str, user_id: str):
         if DEBUG_MEMORY:
             print(f"  🔍 [DEBUG] LLM 返回: {result[:200]}...")
         
-        # 清理可能的 markdown 代码块
+        # 清理 markdown 代码块
         if "```" in result:
-            # 提取 ``` 之间的内容
             parts = result.split("```")
             for part in parts:
                 if "[" in part:
                     result = part.replace("json", "").strip()
                     break
         
-        # 尝试解析 JSON
+        # 解析 JSON
         if result and result != "null" and "[" in result:
             info_list = json.loads(result)
             
             if not isinstance(info_list, list):
-                # 兼容旧版本：如果返回单个对象，转为数组
                 info_list = [info_list]
             
             for info in info_list:
                 if info and isinstance(info, dict) and info.get("content"):
-                    # 生成唯一key
-                    key = f"{info['category']}_{uuid.uuid4().hex[:8]}"
+                    # 存入数据库
+                    added = health_store.add_health_record(
+                        user_id=user_id,
+                        category=info["category"],
+                        content=info["content"],
+                        important=info.get("important", False)
+                    )
                     
-                    record = {
-                        "category": info["category"],
-                        "content": info["content"],
-                        "important": info.get("important", False),
-                        "timestamp": str(uuid.uuid4())[:8]
-                    }
-                    
-                    # 尝试存入 Store
-                    try:
-                        health_store.put(("health", user_id), key, record)
-                    except Exception as e:
-                        if DEBUG_MEMORY:
-                            print(f"  ⚠️ [DEBUG] Store 存储失败: {e}")
-                    
-                    # 同时存入备选字典（这是主要的存储方式）
-                    if user_id not in _health_backup:
-                        _health_backup[user_id] = {}
-                    _health_backup[user_id][key] = record
-                    
-                    print(f"  💾 [长期记忆] 已记录: [{info['category']}] {info['content']}")
-                    extracted_items.append(info)
-            
-            if DEBUG_MEMORY:
-                print(f"  ✅ [DEBUG] 共提取 {len(extracted_items)} 条信息")
-                print(f"  ✅ [DEBUG] _health_backup[{user_id}] = {_health_backup.get(user_id, {})}")
-                    
+                    if added:
+                        print(f"  💾 [持久化记忆] 已记录: [{info['category']}] {info['content']}")
+                        extracted_items.append(info)
+                    elif DEBUG_MEMORY:
+                        print(f"  ℹ️ [DEBUG] 跳过重复记录: {info['content']}")
+                        
     except json.JSONDecodeError as e:
         if DEBUG_MEMORY:
             print(f"  ⚠️ [DEBUG] JSON 解析失败: {e}")
-            print(f"  ⚠️ [DEBUG] 原始内容: {result}")
     except Exception as e:
-        print(f"  ⚠️ 健康信息提取失败: {e}")
+        if DEBUG_MEMORY:
+            print(f"  ⚠️ [DEBUG] 健康信息提取失败: {e}")
     
-    return extracted_items if extracted_items else None
+    return extracted_items
 
 
 def load_health_profile(user_id: str) -> str:
     """
-    从 Store 加载用户的健康档案
+    从数据库加载用户的健康档案
     """
-    if DEBUG_MEMORY:
-        print(f"  📋 [DEBUG] 加载用户档案: {user_id}")
-        print(f"  📋 [DEBUG] _health_backup 所有用户: {list(_health_backup.keys())}")
+    records = health_store.get_health_records(user_id)
     
-    items_dict = {}
-    
-    # 方法1: 尝试从 Store 读取
-    try:
-        # 使用位置参数调用 search
-        items = health_store.search(("health", user_id))
-        for item in items:
-            items_dict[item.key] = item.value
-    except Exception as e:
-        if DEBUG_MEMORY:
-            print(f"  ⚠️ [DEBUG] Store 读取失败: {e}")
-    
-    # 方法2: 从备选字典读取（主要方式）
-    if user_id in _health_backup:
-        for key, value in _health_backup[user_id].items():
-            if key not in items_dict:
-                items_dict[key] = value
-        if DEBUG_MEMORY:
-            print(f"  ✅ [DEBUG] 从 _health_backup 读取到 {len(_health_backup[user_id])} 条记录")
-    else:
-        if DEBUG_MEMORY:
-            print(f"  ⚠️ [DEBUG] 用户 {user_id} 不在 _health_backup 中")
-    
-    if not items_dict:
+    if not records:
         return ""
     
     # 按类别整理
     profile_dict = {}
     important_items = []
     
-    for key, value in items_dict.items():
-        category = value.get("category", "其他")
-        content = value.get("content", "")
-        important = value.get("important", False)
+    for record in records:
+        category = record["category"]
+        content = record["content"]
+        important = record["important"]
         
         if category not in profile_dict:
             profile_dict[category] = []
@@ -270,13 +420,11 @@ def load_health_profile(user_id: str) -> str:
     # 格式化输出
     lines = []
     
-    # 重要信息优先显示
     if important_items:
         lines.append("【⚠️ 重要提醒】")
         lines.extend(important_items)
         lines.append("")
     
-    # 其他信息
     for category, contents in profile_dict.items():
         lines.append(f"【{category}】")
         for c in contents:
@@ -286,35 +434,30 @@ def load_health_profile(user_id: str) -> str:
 
 
 # ============================================================
-# 🆕 对话摘要函数
+# 对话摘要函数
 # ============================================================
-def summarize_old_messages(messages: list, user_id: str) -> tuple[str, list]:
+def summarize_old_messages(messages: list, user_id: str, thread_id: str) -> tuple[str, list]:
     """
-    当对话过长时，将旧消息压缩成摘要
-    返回：(摘要文本, 保留的最近消息)
+    当对话过长时，将旧消息压缩成摘要并保存到数据库
     """
     if len(messages) <= MAX_MESSAGES_BEFORE_SUMMARY:
-        return "", messages  # 不需要摘要
+        return "", messages
     
     print(f"  📝 [对话摘要] 消息数 {len(messages)} 超过阈值，正在压缩...")
     
-    # 分离：需要摘要的旧消息 vs 保留的新消息
     old_messages = messages[:-KEEP_RECENT_MESSAGES]
     recent_messages = messages[-KEEP_RECENT_MESSAGES:]
     
-    # 构建摘要 prompt
     conversation_text = []
     for msg in old_messages:
         if hasattr(msg, 'content') and msg.content:
             role = "用户" if isinstance(msg, HumanMessage) else "助手"
-            # 截断过长的单条消息
             content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
             conversation_text.append(f"{role}: {content}")
     
     summary_prompt = f"""
 请总结以下对话的关键信息，重点提取：
-
-1. 用户提到的身体指标（身高、体重、血压等具体数值）
+1. 用户提到的身体指标（具体数值）
 2. 用户的健康状况（疾病、过敏、症状）
 3. 用户的主要问题和关注点
 4. 助手给出的重要建议
@@ -322,16 +465,19 @@ def summarize_old_messages(messages: list, user_id: str) -> tuple[str, list]:
 对话内容：
 {chr(10).join(conversation_text)}
 
-请用简洁的要点形式总结（不超过300字），保留所有具体数值和重要健康信息：
+请用简洁的要点形式总结（不超过300字）：
 """
     
     try:
         summary = llm.invoke(summary_prompt).content.strip()
+        
+        # 保存到数据库
+        health_store.save_conversation_summary(user_id, thread_id, summary)
+        
         print(f"  ✓ 摘要生成完成，压缩了 {len(old_messages)} 条消息")
         return summary, recent_messages
     except Exception as e:
         print(f"  ⚠️ 摘要生成失败: {e}")
-        # 失败时简单截断
         return "", recent_messages
 
 
@@ -359,7 +505,8 @@ def detect_mode(user_input: str) -> str:
 
 def grade_documents(question: str, docs: List[str]) -> str:
     """评估文档相关性"""
-    if not docs: return "no"
+    if not docs:
+        return "no"
     
     context = "\n".join(docs[:2])
     prompt = f"""
@@ -385,33 +532,38 @@ def rewrite_query(question: str) -> str:
 
 
 # ============================================================
-# 节点定义（已优化）
+# 节点定义
 # ============================================================
 
+# 全局变量用于在节点间传递 thread_id
+_current_thread_id = ""
+
 def router_node(state: GuidedState):
-    """路由节点 - 🆕 增加记忆处理"""
+    """路由节点"""
     messages = state["messages"]
     user_id = state.get("user_id", "anonymous")
     question = messages[-1].content
     
     print(f"\n🧭 [智能路由]")
-    if DEBUG_MEMORY:
-        print(f"  🔑 [DEBUG] user_id = {user_id}")
     
-    # 🆕 Step 1: 提取并存储健康信息
+    # 提取并存储健康信息
     extract_health_info(question, user_id)
     
-    # 🆕 Step 2: 加载用户健康档案
+    # 加载用户健康档案
     health_profile = load_health_profile(user_id)
     if health_profile:
         print(f"  📋 已加载用户健康档案")
     
-    # 🆕 Step 3: 检查是否需要摘要压缩
+    # 检查是否需要摘要压缩
     summary = ""
     if len(messages) > MAX_MESSAGES_BEFORE_SUMMARY:
-        summary, messages = summarize_old_messages(messages, user_id)
+        summary, messages = summarize_old_messages(messages, user_id, _current_thread_id)
     
-    # 智能检测模式
+    # 加载历史摘要
+    recent_summaries = health_store.get_recent_summaries(user_id, limit=2)
+    if recent_summaries:
+        summary = "\n---\n".join([summary] + recent_summaries) if summary else "\n---\n".join(recent_summaries)
+    
     mode = detect_mode(question)
     print(f"  检测到模式: {'🔢 健康评估' if mode == 'assessment' else '📖 医学科普'}")
     
@@ -424,8 +576,8 @@ def router_node(state: GuidedState):
             "loop_step": 0,
             "documents": [],
             "used_web_search": False,
-            "health_profile": health_profile,  # 🆕
-            "summary": summary                  # 🆕
+            "health_profile": health_profile,
+            "summary": summary
         }
     else:
         return {
@@ -436,8 +588,8 @@ def router_node(state: GuidedState):
             "loop_step": 0,
             "documents": [],
             "used_web_search": False,
-            "health_profile": health_profile,  # 🆕
-            "summary": summary                  # 🆕
+            "health_profile": health_profile,
+            "summary": summary
         }
 
 
@@ -501,16 +653,14 @@ def web_search_node(state: GuidedState):
 
 
 def grade_and_generate_node(state: GuidedState):
-    """评分与生成节点 - 🆕 注入健康档案和摘要"""
+    """评分与生成节点"""
     question = state["messages"][-1].content
     docs = state["documents"]
     mode = state.get("mode", "science")
     
-    # 🆕 获取记忆信息
     health_profile = state.get("health_profile", "")
     summary = state.get("summary", "")
     
-    # 评分
     score = grade_documents(question, docs)
     print(f"  评分: {'✓ 相关' if score == 'yes' else '✗ 不相关'}")
     
@@ -519,7 +669,6 @@ def grade_and_generate_node(state: GuidedState):
         context = "\n\n".join(docs)
         source_tag = "(来源: 互联网)" if state["used_web_search"] else "(来源: 医学知识库)"
         
-        # 🆕 构建记忆上下文
         memory_context = ""
         if health_profile:
             memory_context += f"""
@@ -553,7 +702,7 @@ def grade_and_generate_node(state: GuidedState):
 2. 健康建议（具体可行，需考虑用户的健康档案）
 3. 注意事项（特别注意用户的过敏史和疾病史！）
 
-语气要专业但亲切，像医生和朋友的结合。
+语气要专业但亲切。
 """
         else:
             prompt = f"""
@@ -570,7 +719,7 @@ def grade_and_generate_node(state: GuidedState):
 要求：
 1. 先简单回答（2-3句话）
 2. 如有必要，展开详细解释
-3. 给出实用建议（需考虑用户的健康档案，如有）
+3. 给出实用建议（需考虑用户的健康档案）
 4. 如果用户有特殊情况（过敏、疾病），要特别提醒
 5. 语言通俗，不要太多专业术语
 """
@@ -601,7 +750,6 @@ def summarizer_node(state: GuidedState):
     rag_output = state.get("rag_output", "")
     health_profile = state.get("health_profile", "")
     
-    # 🆕 如果有健康档案，添加提示
     profile_note = ""
     if health_profile:
         profile_note = "\n📋 已参考你的健康档案生成个性化建议"
@@ -694,16 +842,22 @@ app = workflow.compile(checkpointer=memory)
 
 
 # ============================================================
-# 🆕 调试命令
+# 用户交互命令
 # ============================================================
 def show_health_profile(user_id: str):
     """显示用户健康档案"""
     profile = load_health_profile(user_id)
+    user_info = health_store.get_user_info(user_id)
+    
     if profile:
         print(f"""
 ╔═══════════════════════════════════════════════════════════╗
 ║                    📋 你的健康档案                         ║
 ╚═══════════════════════════════════════════════════════════╝
+
+👤 用户: {user_info['display_name'] if user_info else user_id}
+🆔 ID: {user_id}
+📅 创建于: {user_info['created_at'] if user_info else '未知'}
 
 {profile}
 """)
@@ -713,27 +867,25 @@ def show_health_profile(user_id: str):
 
 def clear_health_profile(user_id: str):
     """清空用户健康档案"""
-    try:
-        # 清空 Store
-        try:
-            items = health_store.search(("health", user_id))
-            for item in items:
-                health_store.delete(("health", user_id), item.key)
-        except Exception:
-            pass
-        
-        # 清空备选字典
-        if user_id in _health_backup:
-            _health_backup[user_id] = {}
-        
-        print("  ✓ 健康档案已清空")
-    except Exception as e:
-        print(f"  ⚠️ 清空失败: {e}")
+    health_store.clear_health_records(user_id)
+    print("  ✓ 健康档案已清空（用户账号保留）")
 
 
-# ============================================================
-# 交互式菜单
-# ============================================================
+def list_users():
+    """列出所有用户"""
+    users = health_store.list_all_users()
+    if users:
+        print("\n📋 已注册用户列表：")
+        print("─" * 50)
+        for u in users:
+            print(f"  🆔 {u['user_id']}")
+            print(f"     名字: {u['display_name']}")
+            print(f"     最后活跃: {u['last_active']}")
+            print()
+    else:
+        print("\n📋 暂无注册用户\n")
+
+
 def show_mode_menu():
     print("""
 请选择使用模式：
@@ -743,26 +895,85 @@ def show_mode_menu():
   
   💡 或者直接提问，系统会自动识别！
   
-  🆕 新命令：
-     /profile  - 查看我记住的你的健康信息
+  📌 命令：
+     /profile  - 查看健康档案
      /clear    - 清空健康档案
-     /new      - 开始新会话
+     /id       - 查看你的用户ID
+     /users    - 列出所有用户（调试）
      /debug    - 开启/关闭调试模式
+     /new      - 开始新会话（保留记忆）
   
 输入 1 或 2 选择模式，或直接输入问题：
 """)
 
-def show_assessment_guide():
-    print(ASSESSMENT_TOOLS)
-    print("\n请输入你的问题（或输入 /back 返回）：")
 
-def show_science_guide():
-    print(SCIENCE_EXAMPLES)
-    print("\n请输入你的问题（或输入 /back 返回）：")
+# ============================================================
+# 用户登录/注册
+# ============================================================
+def user_login() -> tuple[str, str]:
+    """
+    用户登录流程
+    返回: (user_id, display_name)
+    """
+    print("""
+╔════════════════════════════════════════════════════════════╗
+║                      👤 用户登录                            ║
+╠════════════════════════════════════════════════════════════╣
+║  • 老用户：输入你的ID（如 zhang_a8f3b2c1）                   ║
+║  • 新用户：直接按 Enter，然后输入名字                         ║
+╚════════════════════════════════════════════════════════════╝
+""")
+    
+    user_input = input("🔑 请输入用户ID（新用户按Enter）: ").strip()
+    
+    if user_input:
+        # 尝试登录
+        if health_store.user_exists(user_input):
+            user_info = health_store.get_user_info(user_input)
+            health_store.update_last_active(user_input)
+            print(f"\n✅ 欢迎回来，{user_info['display_name']}！")
+            
+            # 显示已有的健康档案预览
+            records = health_store.get_health_records(user_input)
+            if records:
+                print(f"   📋 已加载 {len(records)} 条健康记录")
+            
+            return user_input, user_info['display_name']
+        else:
+            print(f"\n❌ 用户ID '{user_input}' 不存在")
+            retry = input("   是否创建新账号？(y/n): ").strip().lower()
+            if retry != 'y':
+                return user_login()  # 重新登录
+    
+    # 新用户注册
+    print("\n📝 创建新账号")
+    display_name = input("   请输入你的名字: ").strip()
+    
+    if not display_name:
+        display_name = "匿名用户"
+    
+    # 生成唯一ID
+    user_id = f"{display_name}_{uuid.uuid4().hex[:8]}"
+    
+    # 创建用户
+    health_store.create_user(user_id, display_name)
+    
+    print(f"""
+╔════════════════════════════════════════════════════════════╗
+║                    ✨ 账号创建成功！                         ║
+╠════════════════════════════════════════════════════════════╣
+║  👤 名字: {display_name:<47}║
+║  🆔 ID:   {user_id:<47}║
+║                                                            ║
+║  ⚠️  请牢记你的ID，下次登录时需要输入！                       ║
+╚════════════════════════════════════════════════════════════╝
+""")
+    
+    return user_id, display_name
 
 
 # ============================================================
-# 运行
+# 主程序
 # ============================================================
 if __name__ == "__main__":
     print(WELCOME_MESSAGE)
@@ -771,22 +982,15 @@ if __name__ == "__main__":
         print("⚠️  提示: 未配置 TAVILY_API_KEY，联网搜索将不可用")
         print("   如需使用，请访问 https://tavily.com 获取API密钥\n")
     
-    # 🆕 会话管理（user_id 用于长期记忆）
-    user_id = input("👤 输入你的名字（用于记住你的健康信息，或按Enter匿名）: ").strip()
-    if not user_id:
-        user_id = f"anon_{uuid.uuid4().hex[:8]}"
+    # 用户登录
+    user_id, display_name = user_login()
     
-    thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"  # 每次新会话
+    # 创建会话
+    thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+    set_current_thread_id(thread_id)
     config = {"configurable": {"thread_id": thread_id}}
     
-    print(f"\n✨ 欢迎，{user_id}！")
-    print(f"   会话ID: {thread_id}")
-    
-    # 🆕 检查是否有历史健康档案
-    existing_profile = load_health_profile(user_id)
-    if existing_profile:
-        print(f"   📋 已加载你的健康档案（输入 /profile 查看）")
-    
+    print(f"\n   会话ID: {thread_id}")
     print("━" * 60)
     
     current_mode = None
@@ -800,29 +1004,37 @@ if __name__ == "__main__":
             
             # 退出
             if user_input.lower() in ["q", "quit", "exit"]:
-                print("\n👋 再见！你的健康信息已保存，下次见！")
+                print(f"\n👋 再见，{display_name}！")
+                print(f"   你的健康信息已保存，下次用ID登录即可恢复：{user_id}")
                 break
             
-            # 🆕 新命令：查看健康档案
+            # 命令处理
             if user_input == "/profile":
                 show_health_profile(user_id)
                 continue
             
-            # 🆕 新命令：清空健康档案
             if user_input == "/clear":
                 confirm = input("⚠️ 确定要清空健康档案吗？(y/n): ").strip().lower()
                 if confirm == "y":
                     clear_health_profile(user_id)
                 continue
             
-            # 🆕 新命令：调试模式
+            if user_input == "/id":
+                print(f"\n🆔 你的用户ID: {user_id}")
+                print(f"   （下次登录时输入此ID即可恢复记忆）\n")
+                continue
+            
+            if user_input == "/users":
+                list_users()
+                continue
+            
             if user_input == "/debug":
-                DEBUG_MEMORY = not DEBUG_MEMORY
-                print(f"  调试模式: {'开启' if DEBUG_MEMORY else '关闭'}")
+                toggle_debug_mode()
                 continue
             
             if user_input == "/new":
                 thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+                set_current_thread_id(thread_id)
                 config = {"configurable": {"thread_id": thread_id}}
                 current_mode = None
                 print(f"✨ 新会话: {thread_id}")
@@ -838,11 +1050,11 @@ if __name__ == "__main__":
             
             if user_input == "1":
                 current_mode = "assessment"
-                show_assessment_guide()
+                print("\n请输入你的问题（或输入 /back 返回）：")
                 continue
             elif user_input == "2":
                 current_mode = "science"
-                show_science_guide()
+                print("\n请输入你的问题（或输入 /back 返回）：")
                 continue
             
             # 处理问题
@@ -852,7 +1064,7 @@ if __name__ == "__main__":
             for event in app.stream(
                 {
                     "messages": [HumanMessage(content=user_input)],
-                    "user_id": user_id  # 🆕 传入 user_id
+                    "user_id": user_id
                 },
                 config
             ):
@@ -866,7 +1078,7 @@ if __name__ == "__main__":
             print("\n💬 继续提问，或输入 /back 返回主菜单")
             
         except KeyboardInterrupt:
-            print("\n\n👋 再见！")
+            print(f"\n\n👋 再见！你的ID: {user_id}")
             break
         except Exception as e:
             print(f"\n❌ 出错了: {e}")
