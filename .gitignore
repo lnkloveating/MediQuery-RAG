@@ -14,3 +14,7 @@ medical_db/
 
 # 环境配置文件 
 .env
+
+user_data/
+user_profiles/
+hitl_reviews/

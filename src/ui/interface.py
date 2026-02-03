@@ -16,6 +16,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memory import profile_store, load_health_profile
 
+# 导入结构化问诊模块
+from consultation.structured_consultation import (
+    StructuredConsultation,
+    RiskLevel,
+    QuestionStage,
+)
+
 
 # ============================================================
 # 全局变量
@@ -39,10 +46,10 @@ def show_welcome():
 ║                                                          ║
 ║   请选择服务模式：                                        ║
 ║                                                          ║
-║   [1] 🩺 个人健康顾问                                    ║
-║       • 记住你的身体数据和健康状况                        ║
-║       • 提供个性化的健康评估和建议                        ║
-║       • 关闭后下次登录可恢复记忆                          ║
+║   [1] 🩺 智能健康问诊（推荐）                             ║
+║       • 系统引导式问诊，无需自己描述                       ║
+║       • 自动评估症状风险等级                              ║
+║       • 高危症状立即提醒就医                              ║
 ║                                                          ║
 ║   [2] 📚 医学科普问答                                    ║
 ║       • 无需登录，直接提问                                ║
@@ -54,14 +61,355 @@ def show_welcome():
 
 
 # ============================================================
-# 用户登录
+# 结构化问诊 - 打印问题
+# ============================================================
+def print_question(question: dict, index: int = None):
+    """格式化打印问题"""
+    print()
+    if index:
+        print(f"【问题 {index}】")
+    
+    print(f"🤖 {question['question']}")
+    
+    # 如果有选项，打印选项
+    if question.get("options"):
+        print()
+        for i, opt in enumerate(question["options"], 1):
+            print(f"   {i}. {opt}")
+        print()
+        print("   💡 输入数字选择，或直接输入内容")
+    
+    if question.get("placeholder"):
+        print(f"   💡 示例：{question['placeholder']}")
+    
+    print()
+
+
+# ============================================================
+# 健康顾问模式（结构化问诊）
+# ============================================================
+def run_health_advisor(app) -> str:
+    """
+    运行健康顾问模式 - 结构化问诊流程
+    
+    系统主导提问，用户只需回答
+    
+    Args:
+        app: 编译后的 LangGraph app
+    
+    Returns:
+        "exit_program" 或 "back_to_menu"
+    """
+    print()
+    print("=" * 58)
+    print("  🩺 智能健康问诊")
+    print("=" * 58)
+    print()
+    print("📋 本服务将通过结构化问诊收集您的健康信息")
+    print("⚠️  本服务仅供参考，不能替代医生诊断")
+    print()
+    print("-" * 58)
+    
+    # 创建问诊实例
+    consultation = StructuredConsultation()
+    
+    # ========== 第1步：用户识别 ==========
+    print()
+    print("【第一步：用户识别】")
+    print()
+    print("请输入您的手机号（用于识别身份和保存档案）")
+    print("💡 老用户输入相同手机号可恢复历史档案")
+    print()
+    
+    while True:
+        identifier = input("📱 您的手机号：").strip()
+        
+        if identifier.lower() in ['q', '/q']:
+            return "back_to_menu"
+        
+        if identifier.lower() in ['qq', '/qq']:
+            print("\n👋 再见！")
+            return "exit_program"
+        
+        if not identifier:
+            print("⚠️  请输入手机号")
+            continue
+        
+        if len(identifier) < 6:
+            print("⚠️  请输入有效的手机号")
+            continue
+        
+        break
+    
+    # 识别用户
+    user, is_new = consultation.identify_user(identifier)
+    
+    print()
+    print("-" * 58)
+    
+    if is_new:
+        print(f"\n👋 欢迎新用户！")
+        print(f"   您的档案ID: {user.user_id[:8]}...")
+        print(f"   首次问诊需要先收集基础信息")
+    else:
+        print(f"\n👋 欢迎回来！")
+        print(f"   档案ID: {user.user_id[:8]}...")
+        print(f"   上次访问: {user.last_visit}")
+        
+        # 显示已有信息
+        if consultation.has_complete_profile():
+            print(f"\n📋 您的已有档案：")
+            print(f"   ├── 性别: {user.gender}")
+            print(f"   ├── 年龄: {int(user.age)}岁")
+            print(f"   ├── 身高: {user.height}cm | 体重: {user.weight}kg")
+            if user.weight and user.height:
+                bmi = round(user.weight / ((user.height/100) ** 2), 1)
+                print(f"   ├── BMI: {bmi}")
+            if user.allergies and user.allergies != ['无']:
+                print(f"   ├── ⚠️ 过敏: {', '.join(user.allergies)}")
+            if user.chronic_diseases and user.chronic_diseases != ['无']:
+                print(f"   └── ⚠️ 慢性病: {', '.join(user.chronic_diseases)}")
+            else:
+                print(f"   └── 无已知慢性病")
+            print()
+            print("   ✅ 基础信息完整，直接进入症状描述")
+    
+    print()
+    print("-" * 58)
+    input("\n按回车键开始问诊（输入 q 可随时退出）...")
+    
+    # ========== 第2步：开始问诊 ==========
+    session = consultation.start_session()
+    
+    stage_names = {
+        QuestionStage.BASIC_INFO: "📊 基础信息采集",
+        QuestionStage.MEDICAL_HISTORY: "📋 病史信息采集", 
+        QuestionStage.CURRENT_SYMPTOMS: "🩺 当前症状描述",
+    }
+    
+    current_stage = None
+    question_count = 0
+    
+    while True:
+        # 获取当前问题
+        question = consultation.get_current_question()
+        
+        if not question:
+            # 没有更多问题，尝试切换阶段
+            continue_flag, msg, risk = consultation._advance_stage()
+            
+            if msg:
+                print(f"\n{'─'*40}")
+                print(f"📌 {msg}")
+                print(f"{'─'*40}")
+            
+            if not continue_flag:
+                break
+            continue
+        
+        # 检查是否进入新阶段
+        stage = session.current_stage
+        if stage != current_stage and stage in stage_names:
+            current_stage = stage
+            print()
+            print("=" * 58)
+            print(f"  {stage_names[stage]}")
+            print("=" * 58)
+        
+        # 显示问题
+        question_count += 1
+        print_question(question, question_count)
+        
+        # 获取用户输入
+        while True:
+            answer = input("👤 您的回答：").strip()
+            
+            if answer.lower() in ['q', '/q']:
+                print("\n⚠️  问诊已中断，您的信息已保存。")
+                consultation.save_session()
+                return "back_to_menu"
+            
+            if answer.lower() in ['qq', '/qq']:
+                print("\n👋 再见！您的信息已保存。")
+                consultation.save_session()
+                return "exit_program"
+            
+            if not answer:
+                print("⚠️  请输入您的回答")
+                continue
+            
+            break
+        
+        # 处理回答
+        continue_flag, msg, risk = consultation.process_answer(answer)
+        
+        if msg:
+            print(f"\n{msg}")
+        
+        # 风险判断 - 高危立即退出
+        if risk == RiskLevel.CRITICAL:
+            print()
+            print("!" * 58)
+            print("  ⚠️  本次咨询已结束，请立即就医！")
+            print("!" * 58)
+            consultation.save_session()
+            input("\n按回车键返回主菜单...")
+            return "back_to_menu"
+        
+        if not continue_flag:
+            break
+    
+    # ========== 第3步：评估与建议 ==========
+    print()
+    print("=" * 58)
+    print("  📊 评估结果")
+    print("=" * 58)
+    
+    risk_level = RiskLevel(session.risk_level) if session.risk_level else RiskLevel.LOW
+    summary = consultation.get_consultation_summary()
+    
+    print(f"\n📋 问诊摘要：")
+    print(f"   ├── 主诉: {summary['current_complaint']['chief_complaint']}")
+    print(f"   ├── 持续时间: {summary['current_complaint']['duration']}")
+    print(f"   ├── 严重程度: {summary['current_complaint']['severity']}/10")
+    print(f"   └── 风险等级: {risk_level.value.upper()}")
+    
+    # 根据风险等级决定是否调用RAG
+    if risk_level == RiskLevel.LOW:
+        print()
+        print("✅ 您的情况属于低风险，正在生成健康建议...")
+        print()
+        
+        # 构造RAG查询
+        query = _build_rag_query(summary)
+        
+        try:
+            thread_id = f"{user.user_id}_{uuid.uuid4().hex[:8]}"
+            config = {"configurable": {"thread_id": thread_id}}
+            
+            print("-" * 58)
+            print("💡 健康建议：")
+            print("-" * 58)
+            
+            for event in app.stream(
+                {"messages": [HumanMessage(content=query)], "user_id": user.user_id},
+                config
+            ):
+                if "summarizer" in event:
+                    print(event["summarizer"]["final_answer"])
+            
+            print("-" * 58)
+            
+            # 保存建议
+            session.advice_given = "已通过RAG生成建议"
+            consultation.save_session()
+            
+        except Exception as e:
+            print(f"⚠️  生成建议时出错: {e}")
+            print("建议您咨询专业医生获取更详细的建议。")
+    
+    elif risk_level == RiskLevel.MEDIUM:
+        print()
+        print("⚠️  您的情况建议尽快就医检查")
+        print()
+        
+        confirm = input("是否需要一些初步的健康建议作为参考？(y/n): ").strip().lower()
+        
+        if confirm == 'y':
+            query = _build_rag_query(summary)
+            
+            try:
+                thread_id = f"{user.user_id}_{uuid.uuid4().hex[:8]}"
+                config = {"configurable": {"thread_id": thread_id}}
+                
+                print()
+                print("-" * 58)
+                print("💡 初步建议（仅供参考，请务必就医）：")
+                print("-" * 58)
+                
+                for event in app.stream(
+                    {"messages": [HumanMessage(content=query)], "user_id": user.user_id},
+                    config
+                ):
+                    if "summarizer" in event:
+                        print(event["summarizer"]["final_answer"])
+                
+                print("-" * 58)
+                
+            except Exception as e:
+                print(f"⚠️  生成建议时出错: {e}")
+    
+    # 生成Markdown历史
+    consultation.generate_history_markdown()
+    
+    print()
+    print("=" * 58)
+    print(f"📄 问诊记录已保存")
+    print(f"   档案位置: user_data/{user.user_id[:8]}...")
+    print("=" * 58)
+    
+    input("\n按回车键返回主菜单...")
+    return "back_to_menu"
+
+
+def _build_rag_query(summary: dict) -> str:
+    """根据问诊摘要构建RAG查询"""
+    parts = []
+    
+    # 用户基本情况
+    profile = summary.get("user_profile", {})
+    if profile.get("gender") and profile.get("age"):
+        parts.append(f"患者是{profile['age']}岁{profile['gender']}性")
+    
+    if profile.get("bmi"):
+        bmi = profile["bmi"]
+        if bmi >= 28:
+            parts.append("体重偏胖(BMI={})".format(bmi))
+        elif bmi < 18.5:
+            parts.append("体重偏瘦(BMI={})".format(bmi))
+    
+    # 病史
+    if profile.get("chronic_diseases"):
+        diseases = [d for d in profile["chronic_diseases"] if d != "无"]
+        if diseases:
+            parts.append(f"有{', '.join(diseases)}病史")
+    
+    if profile.get("allergies"):
+        allergies = [a for a in profile["allergies"] if a != "无"]
+        if allergies:
+            parts.append(f"对{', '.join(allergies)}过敏")
+    
+    # 主诉
+    complaint = summary.get("current_complaint", {})
+    if complaint.get("chief_complaint"):
+        parts.append(f"目前的问题是：{complaint['chief_complaint']}")
+    
+    if complaint.get("duration"):
+        parts.append(f"症状持续{complaint['duration']}")
+    
+    # 构建查询
+    context = "，".join(parts) if parts else "用户咨询健康问题"
+    
+    query = f"""
+{context}。
+
+请根据以上情况，提供健康建议，包括：
+1. 可能的原因分析
+2. 日常注意事项  
+3. 饮食和运动建议
+4. 是否需要进一步检查
+
+注意：这是健康科普建议，不是医疗诊断。请用通俗易懂的语言回答。
+"""
+    return query
+
+
+# ============================================================
+# 用户登录（保留兼容）
 # ============================================================
 def user_login() -> tuple:
     """
-    用户登录/注册流程
-    
-    Returns:
-        (user_id, display_name)
+    用户登录/注册流程（旧版，保留兼容）
     """
     print("""
 ┌──────────────────────────────────────────────────────────┐
@@ -128,80 +476,6 @@ def show_health_profile(user_id: str):
 """)
     else:
         print("\n📋 健康档案为空，告诉我你的身高体重、过敏史等信息，我会记住。\n")
-
-
-# ============================================================
-# 健康顾问模式
-# ============================================================
-def run_health_advisor(app) -> str:
-    """
-    运行健康顾问模式
-    
-    Args:
-        app: 编译后的 LangGraph app
-    
-    Returns:
-        "exit_program" 或 "back_to_menu"
-    """
-    user_id, display_name = user_login()
-    thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
-    set_current_thread_id(thread_id)
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    print(f"""
-{'━' * 58}
-  🩺 健康顾问模式 | {display_name}
-  
-  /p 查看档案 | /c 清空档案 | /id 查看ID
-  /q 返回主菜单 | /qq 退出程序
-{'━' * 58}
-""")
-    
-    while True:
-        try:
-            user_input = input("\n👉 ").strip()
-            
-            if not user_input:
-                continue
-            
-            # 命令处理
-            if user_input == "/qq":
-                print(f"\n👋 再见！你的ID: {user_id}")
-                return "exit_program"
-            
-            if user_input in ["/q", "q"]:
-                print(f"\n📋 已保存，你的ID: {user_id}")
-                return "back_to_menu"
-            
-            if user_input == "/p":
-                show_health_profile(user_id)
-                continue
-            
-            if user_input == "/c":
-                if input("⚠️ 确定清空？(y/n): ").strip().lower() == "y":
-                    profile_store.clear_health_records(user_id)
-                    print("  ✓ 已清空")
-                continue
-            
-            if user_input == "/id":
-                print(f"\n🆔 {user_id}")
-                continue
-            
-            # 处理问题
-            for event in app.stream(
-                {"messages": [HumanMessage(content=user_input)], "user_id": user_id},
-                config
-            ):
-                if "summarizer" in event:
-                    print(event["summarizer"]["final_answer"])
-            
-        except KeyboardInterrupt:
-            print(f"\n\n📋 已保存，你的ID: {user_id}")
-            return "back_to_menu"
-        except Exception as e:
-            print(f"\n❌ 出错: {e}")
-    
-    return "back_to_menu"
 
 
 # ============================================================
