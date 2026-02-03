@@ -12,6 +12,7 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 import sqlite3
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import trim_messages, SystemMessage
 
 # 导入模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -88,6 +89,16 @@ class GuidedState(TypedDict):
     loop_step: int
     used_web_search: bool
 
+
+# 防止token超，创建消息裁剪器
+message_trimmer = trim_messages(
+    strategy="last",
+    max_tokens=4000,
+    token_counter=len,  # 简单用字符数估算，或用 llm
+    include_system=True,
+    start_on="human"
+)
+
 # --- 辅助函数 ---
 
 def detect_mode(user_input: str) -> str:
@@ -142,6 +153,11 @@ def rewrite_query(question: str) -> str:
 
 def router_node(state: GuidedState):
     """路由节点"""
+    # 裁剪历史消息
+    all_messages = state["messages"]
+    if len(all_messages) > 10:  # 超过10轮开始裁剪
+        trimmed = message_trimmer.invoke(all_messages)
+        # 注意：这里只是用于当前处理，不改变 state
     question = state["messages"][-1].content
     
     # 智能检测模式
