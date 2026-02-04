@@ -4,7 +4,7 @@
 设计理念：
 - 系统主导提问，不让用户自由输入
 - 每一步提取关键信息存入JSON
-- 实时风险评估，高危情况立即终止并建议就医
+- 风险评估：极端情况硬规则 + 其他情况大模型判断
 
 问诊流程：
 1. 用户识别（手机号/ID → UUID）
@@ -33,24 +33,14 @@ from config.settings import BASE_DIR
 # ============================================================
 USER_DATA_DIR = os.path.join(BASE_DIR, "user_data")
 
-# 高危关键词 - 检测到立即建议就医
-HIGH_RISK_KEYWORDS = [
-    # 心血管急症
-    "胸闷", "胸痛", "心脏疼", "心绞痛", "心慌", "心悸", 
-    "喘不上气", "呼吸困难", "憋气", "濒死感",
-    # 脑血管急症
-    "剧烈头痛", "突然头痛", "半边身体麻", "说不出话", "口齿不清",
-    "看不清", "突然看不见", "意识模糊", "晕厥",
-    # 其他急症
-    "大量出血", "吐血", "便血", "咳血",
-    "高烧不退", "持续高烧", "抽搐", "惊厥",
-    "剧烈腹痛", "腹部剧痛",
-    "严重过敏", "全身肿", "喉咙肿",
-    # 精神急症
-    "想自杀", "不想活", "自残", "自伤",
+# 🔴 极端情况关键词 - 硬规则，直接退出（不经过大模型）
+# 只保留自杀自残等必须立即干预的情况
+EMERGENCY_KEYWORDS = [
+    "想自杀", "不想活", "要自杀", "自杀", "自残", "自伤",
+    "想死", "活不下去", "结束生命",
 ]
 
-# 中等风险关键词 - 建议就医但可提供初步建议
+# 中等风险关键词（用于最终评估参考）
 MEDIUM_RISK_KEYWORDS = [
     "持续疼痛", "反复发作", "越来越严重",
     "发烧", "高血压", "低血压", "心律不齐",
@@ -68,6 +58,41 @@ LOW_RISK_TOPICS = [
     "久坐", "缺乏运动",
     "饮食习惯", "健康饮食",
 ]
+
+
+# ============================================================
+# 大模型风险评估 Prompt
+# ============================================================
+RISK_ASSESSMENT_PROMPT = """你是一名经验丰富的急诊分诊护士，需要根据患者描述判断紧急程度。
+
+【患者信息】
+- 年龄：{age}岁
+- 性别：{gender}
+- 慢性病史：{chronic_diseases}
+- 过敏史：{allergies}
+- 症状描述：{symptoms}
+
+【判断标准】
+- CRITICAL（危急）：需要立即拨打120或去急诊
+  例如：胸痛+冒冷汗+呼吸困难、疑似心梗/中风、大量出血、严重过敏反应
+  
+- HIGH（紧急）：需要尽快就医（24小时内）
+  例如：持续剧烈疼痛、症状快速加重、高烧不退
+  
+- MEDIUM（中等）：建议近期就医检查
+  例如：反复发作的症状、影响日常生活、持续一周以上
+  
+- LOW（低风险）：可以继续咨询给建议
+  例如：偶发轻微症状、有明确诱因（如天气热导致的轻微不适）、生活方式问题
+
+【重要】请综合考虑：
+1. 症状的严重程度描述（"有点"vs"非常"vs"剧烈"）
+2. 是否有合理的诱因解释
+3. 患者的年龄和基础病史
+4. 症状的持续时间和变化趋势
+
+请直接输出JSON格式（不要任何其他内容）：
+{{"risk_level": "CRITICAL/HIGH/MEDIUM/LOW", "reason": "简短判断理由", "advice": "给患者的建议"}}"""
 
 
 class RiskLevel(str, Enum):
@@ -131,6 +156,7 @@ class ConsultationSession:
     # 评估结果
     risk_level: str = ""
     risk_keywords_found: List[str] = field(default_factory=list)
+    llm_risk_reason: str = ""              # 大模型判断理由
     
     # 建议
     advice_given: str = ""
@@ -229,17 +255,22 @@ class StructuredConsultation:
     核心功能：
     - 用户识别与档案管理
     - 系统主导的问诊流程
-    - 实时风险评估
+    - 实时风险评估（大模型判断）
     - JSON档案存储
     """
     
-    def __init__(self, data_dir: str = USER_DATA_DIR):
+    def __init__(self, data_dir: str = USER_DATA_DIR, llm=None):
         self.data_dir = data_dir
+        self.llm = llm  # 大模型实例
         self._ensure_dirs()
         
         self.current_user: Optional[UserProfile] = None
         self.current_session: Optional[ConsultationSession] = None
         self.current_question_index: int = 0
+    
+    def set_llm(self, llm):
+        """设置大模型实例"""
+        self.llm = llm
     
     def _ensure_dirs(self):
         """确保目录存在"""
@@ -255,31 +286,14 @@ class StructuredConsultation:
         return user_dir
     
     def _generate_user_id(self, identifier: str) -> str:
-        """
-        从用户标识生成UUID
-        
-        Args:
-            identifier: 手机号或其他标识
-        
-        Returns:
-            确定性的UUID（同一标识始终生成同一ID）
-        """
-        # 使用MD5生成确定性的UUID
+        """从用户标识生成UUID"""
         hash_obj = hashlib.md5(identifier.encode())
         return str(uuid.UUID(hash_obj.hexdigest()))
     
     # ==================== 用户管理 ====================
     
     def identify_user(self, identifier: str) -> Tuple[UserProfile, bool]:
-        """
-        用户识别
-        
-        Args:
-            identifier: 手机号或其他标识
-        
-        Returns:
-            (用户档案, 是否是新用户)
-        """
+        """用户识别"""
         user_id = self._generate_user_id(identifier)
         user_dir = self._get_user_dir(user_id)
         profile_path = os.path.join(user_dir, "profile.json")
@@ -287,7 +301,6 @@ class StructuredConsultation:
         is_new_user = not os.path.exists(profile_path)
         
         if is_new_user:
-            # 创建新用户
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             profile = UserProfile(
                 user_id=user_id,
@@ -297,7 +310,6 @@ class StructuredConsultation:
             )
             self._save_profile(profile)
         else:
-            # 加载现有用户
             profile = self._load_profile(user_id)
             profile.last_visit = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save_profile(profile)
@@ -345,7 +357,6 @@ class StructuredConsultation:
         now = datetime.now()
         session_id = now.strftime("%Y%m%d_%H%M%S")
         
-        # 决定从哪个阶段开始
         if self.has_complete_profile():
             start_stage = QuestionStage.CURRENT_SYMPTOMS
         else:
@@ -397,15 +408,7 @@ class StructuredConsultation:
         return questions[self.current_question_index]
     
     def process_answer(self, answer: str) -> Tuple[bool, Optional[str], Optional[RiskLevel]]:
-        """
-        处理用户回答
-        
-        Args:
-            answer: 用户的回答
-        
-        Returns:
-            (是否继续, 系统消息, 风险等级（如果评估了的话）)
-        """
+        """处理用户回答"""
         if not self.current_session or not self.current_user:
             return False, "会话未初始化", None
         
@@ -458,23 +461,19 @@ class StructuredConsultation:
         
         if q_type == "choice":
             options = question.get("options", [])
-            # 允许输入数字选择
             if answer.isdigit():
                 idx = int(answer) - 1
                 if 0 <= idx < len(options):
                     return options[idx]
-            # 或直接输入选项
             if answer in options:
                 return answer
             return None
         
         elif q_type == "multi_choice":
-            # 支持逗号分隔的多选
             if answer == "无" or answer == "没有":
                 return []
             selected = [a.strip() for a in answer.replace("，", ",").split(",")]
             options = question.get("options", [])
-            # 验证每个选项
             valid = []
             for s in selected:
                 if s.isdigit():
@@ -483,7 +482,7 @@ class StructuredConsultation:
                         valid.append(options[idx])
                 elif s in options or s == "其他":
                     valid.append(s)
-            return valid if valid else selected  # 允许自由输入
+            return valid if valid else selected
         
         elif q_type == "number":
             try:
@@ -513,7 +512,6 @@ class StructuredConsultation:
             if isinstance(value, list):
                 setattr(self.current_user, field_name, value)
             else:
-                # 文本转列表
                 if value and value != "无":
                     setattr(self.current_user, field_name, [value])
                 else:
@@ -537,7 +535,6 @@ class StructuredConsultation:
             return True, "病史信息已记录，请描述您今天的问题", None
         
         elif stage == QuestionStage.CURRENT_SYMPTOMS:
-            # 症状收集完成，进行最终评估
             self.current_session.current_stage = QuestionStage.ASSESSMENT
             return self._do_final_assessment()
         
@@ -547,64 +544,141 @@ class StructuredConsultation:
     
     def _assess_risk_realtime(self, text: str) -> Tuple[RiskLevel, Optional[str]]:
         """
-        实时风险评估
+        实时风险评估（两层判断）
         
-        检测高危关键词，立即响应
+        第一层：极端情况关键词（硬规则）→ 直接退出
+        第二层：其他所有情况 → 大模型判断
         """
         text_lower = text.lower()
         
-        # 检测高危关键词
-        found_high = []
-        for keyword in HIGH_RISK_KEYWORDS:
+        # 第一层：极端情况（自杀自残等）- 硬规则，直接退出
+        for keyword in EMERGENCY_KEYWORDS:
             if keyword in text_lower:
-                found_high.append(keyword)
-        
-        if found_high:
-            self.current_session.risk_keywords_found = found_high
-            msg = f"""
-⚠️⚠️⚠️ 紧急提醒 ⚠️⚠️⚠️
+                self.current_session.risk_keywords_found = [keyword]
+                msg = f"""
+⚠️⚠️⚠️ 重要提醒 ⚠️⚠️⚠️
 
-检测到您描述的症状可能较为严重：{', '.join(found_high)}
+我注意到您提到了"{keyword}"，我非常担心您现在的状态。
 
-【请立即前往最近的医院急诊就医！】
+【请立即寻求帮助】
+• 全国心理援助热线：400-161-9995
+• 北京心理危机研究与干预中心：010-82951332
+• 或者告诉身边信任的人
 
-这些症状可能与急性疾病相关，需要专业医生面诊检查。
-本系统无法替代医生诊断，为了您的安全，请立即就医。
-
-如有紧急情况请拨打 120 急救电话。
+您的生命很重要，请相信困难是暂时的。
+如果您愿意，可以和我聊聊您的感受。
 """
-            return RiskLevel.CRITICAL, msg
+                return RiskLevel.CRITICAL, msg
         
+        # 第二层：调用大模型判断
+        if self.llm:
+            return self._llm_risk_assessment(text)
+        
+        # 如果没有大模型，返回低风险继续问诊
         return RiskLevel.LOW, None
     
-    def _do_final_assessment(self) -> Tuple[bool, str, RiskLevel]:
-        """
-        最终风险评估
+    def _llm_risk_assessment(self, symptoms_text: str) -> Tuple[RiskLevel, Optional[str]]:
+        """调用大模型进行风险评估"""
+        user = self.current_user
         
-        综合所有收集的信息进行评估
-        """
+        # 准备用户信息
+        age = int(user.age) if user and user.age else "未知"
+        gender = user.gender if user and user.gender else "未知"
+        chronic = ", ".join(user.chronic_diseases) if user and user.chronic_diseases else "无"
+        allergies = ", ".join(user.allergies) if user and user.allergies else "无"
+        
+        prompt = RISK_ASSESSMENT_PROMPT.format(
+            age=age,
+            gender=gender,
+            chronic_diseases=chronic,
+            allergies=allergies,
+            symptoms=symptoms_text
+        )
+        
+        try:
+            print("  🤖 [AI正在分析症状严重程度...]")
+            response = self.llm.invoke(prompt).content.strip()
+            
+            # 清理可能的markdown标记
+            if "```" in response:
+                parts = response.split("```")
+                for part in parts:
+                    if "{" in part:
+                        response = part.replace("json", "").strip()
+                        break
+            
+            result = json.loads(response)
+            
+            risk_map = {
+                "CRITICAL": RiskLevel.CRITICAL,
+                "HIGH": RiskLevel.HIGH,
+                "MEDIUM": RiskLevel.MEDIUM,
+                "LOW": RiskLevel.LOW,
+            }
+            
+            level = risk_map.get(result.get("risk_level", "LOW").upper(), RiskLevel.LOW)
+            reason = result.get("reason", "")
+            advice = result.get("advice", "")
+            
+            # 保存判断理由
+            self.current_session.llm_risk_reason = reason
+            
+            if level == RiskLevel.CRITICAL:
+                msg = f"""
+⚠️⚠️⚠️ 紧急提醒 ⚠️⚠️⚠️
+
+根据您的描述，情况可能比较紧急。
+
+【AI判断】{reason}
+
+【建议】{advice}
+
+请立即前往最近的医院急诊就医！
+如有需要请拨打 120 急救电话。
+"""
+                return RiskLevel.CRITICAL, msg
+            
+            elif level == RiskLevel.HIGH:
+                msg = f"""
+⚠️ 健康提醒
+
+【AI判断】{reason}
+
+【建议】{advice}
+
+建议您尽快（24小时内）前往医院就诊。
+"""
+                # HIGH级别不退出，但记录下来
+                self.current_session.risk_keywords_found = ["AI判断为高风险"]
+                return RiskLevel.HIGH, msg
+            
+            # MEDIUM 和 LOW 都继续问诊
+            return RiskLevel.LOW, None
+            
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️ AI返回格式错误，继续问诊")
+            return RiskLevel.LOW, None
+        except Exception as e:
+            print(f"  ⚠️ AI判断出错: {e}，继续问诊")
+            return RiskLevel.LOW, None
+    
+    def _do_final_assessment(self) -> Tuple[bool, str, RiskLevel]:
+        """最终风险评估"""
         session = self.current_session
         user = self.current_user
         
-        # 收集所有文本进行关键词检测
+        # 如果之前已经有高风险判断
+        if session.llm_risk_reason:
+            # 已经由大模型判断过了
+            pass
+        
+        # 收集所有文本进行最终评估
         all_text = " ".join([
-            session.chief_complaint,
-            session.symptom_description,
-            " ".join(user.chronic_diseases),
-            " ".join(user.allergies),
+            session.chief_complaint or "",
+            session.symptom_description or "",
         ])
         
-        # 高危检测
-        found_high = [k for k in HIGH_RISK_KEYWORDS if k in all_text]
-        if found_high:
-            session.risk_level = RiskLevel.HIGH.value
-            session.risk_keywords_found = found_high
-            session.referral_suggested = True
-            self.save_session()
-            
-            return False, self._generate_high_risk_advice(found_high), RiskLevel.HIGH
-        
-        # 中等风险检测
+        # 中等风险检测（关键词 + 严重程度）
         found_medium = [k for k in MEDIUM_RISK_KEYWORDS if k in all_text]
         severity = float(session.symptom_severity) if session.symptom_severity else 0
         
@@ -621,33 +695,6 @@ class StructuredConsultation:
         self.save_session()
         
         return True, "感谢您提供的信息，我来为您分析一下...", RiskLevel.LOW
-    
-    def _generate_high_risk_advice(self, keywords: List[str]) -> str:
-        """生成高风险建议"""
-        return f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️  重要健康提醒  ⚠️
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-根据您描述的症状（{', '.join(keywords[:3])}），
-我们强烈建议您尽快前往医院就诊。
-
-【建议就医科室】
-• 如有胸痛、呼吸困难 → 心内科/急诊
-• 如有剧烈头痛、肢体麻木 → 神经内科/急诊
-• 如有大量出血 → 急诊
-
-【就医前注意事项】
-1. 保持冷静，不要剧烈活动
-2. 如有家人陪同更好
-3. 带上您正在服用的药物清单
-4. 记录症状发作的时间
-
-本系统为健康科普服务，无法替代医生诊断。
-祝您早日康复！
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
     
     def _generate_medium_risk_message(self, keywords: List[str]) -> str:
         """生成中等风险消息"""
@@ -666,11 +713,7 @@ class StructuredConsultation:
 """
     
     def get_consultation_summary(self) -> Dict:
-        """
-        获取问诊摘要
-        
-        返回可用于RAG查询的结构化信息
-        """
+        """获取问诊摘要"""
         if not self.current_session or not self.current_user:
             return {}
         
@@ -692,6 +735,7 @@ class StructuredConsultation:
             "risk_assessment": {
                 "level": self.current_session.risk_level,
                 "keywords": self.current_session.risk_keywords_found,
+                "llm_reason": self.current_session.llm_risk_reason,
             }
         }
     
@@ -751,7 +795,7 @@ class StructuredConsultation:
                     f"## 问诊记录",
                     f"",
                 ])
-                for sf in session_files[:10]:  # 最近10次
+                for sf in session_files[:10]:
                     session_path = os.path.join(sessions_dir, sf)
                     try:
                         with open(session_path, 'r', encoding='utf-8') as f:
@@ -760,6 +804,7 @@ class StructuredConsultation:
                             f"### {session.get('start_time', sf)}",
                             f"- **主诉**: {session.get('chief_complaint', '未记录')}",
                             f"- **风险等级**: {session.get('risk_level', '未评估')}",
+                            f"- **AI判断**: {session.get('llm_risk_reason', '无')}",
                             f"",
                         ])
                     except:

@@ -88,7 +88,7 @@ def print_question(question: dict, index: int = None):
 # ============================================================
 # 健康顾问模式（结构化问诊）
 # ============================================================
-def run_health_advisor(app) -> str:
+def run_health_advisor(app, llm=None) -> str:
     """
     运行健康顾问模式 - 结构化问诊流程
     
@@ -96,6 +96,7 @@ def run_health_advisor(app) -> str:
     
     Args:
         app: 编译后的 LangGraph app
+        llm: 大模型实例（用于风险评估）
     
     Returns:
         "exit_program" 或 "back_to_menu"
@@ -110,8 +111,8 @@ def run_health_advisor(app) -> str:
     print()
     print("-" * 58)
     
-    # 创建问诊实例
-    consultation = StructuredConsultation()
+    # 创建问诊实例，传入llm用于风险评估
+    consultation = StructuredConsultation(llm=llm)
     
     # ========== 第1步：用户识别 ==========
     print()
