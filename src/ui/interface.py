@@ -1,11 +1,11 @@
 """
+src/ui/interface.py
 用户界面模块
 负责：所有终端显示和用户交互
 
-扩展指南：
-- 修改欢迎界面：编辑 show_welcome()
-- 修改命令：编辑 run_health_advisor() 或 run_science_qa()
-- 添加新模式：创建新的 run_xxx() 函数
+更新说明：
+- 集成自动健康评估展示 (BMI/BMR)
+- 优化 RAG 查询构建，利用后端计算数据
 """
 import uuid
 from langchain_core.messages import HumanMessage
@@ -48,6 +48,7 @@ def show_welcome():
 ║                                                          ║
 ║   [1] 🩺 智能健康问诊（推荐）                             ║
 ║       • 系统引导式问诊，无需自己描述                       ║
+║       • 自动计算 BMI/BMR 并评估身体状况                    ║
 ║       • 自动评估症状风险等级                              ║
 ║       • 高危症状立即提醒就医                              ║
 ║                                                          ║
@@ -91,15 +92,7 @@ def print_question(question: dict, index: int = None):
 def run_health_advisor(app, llm=None) -> str:
     """
     运行健康顾问模式 - 结构化问诊流程
-    
-    系统主导提问，用户只需回答
-    
-    Args:
-        app: 编译后的 LangGraph app
-        llm: 大模型实例（用于风险评估）
-    
-    Returns:
-        "exit_program" 或 "back_to_menu"
+    包含：自动身体指标分析展示
     """
     print()
     print("=" * 58)
@@ -111,7 +104,7 @@ def run_health_advisor(app, llm=None) -> str:
     print()
     print("-" * 58)
     
-    # 创建问诊实例，传入llm用于风险评估
+    # 创建问诊实例
     consultation = StructuredConsultation(llm=llm)
     
     # ========== 第1步：用户识别 ==========
@@ -163,17 +156,12 @@ def run_health_advisor(app, llm=None) -> str:
             print(f"   ├── 性别: {user.gender}")
             print(f"   ├── 年龄: {int(user.age)}岁")
             print(f"   ├── 身高: {user.height}cm | 体重: {user.weight}kg")
-            if user.weight and user.height:
-                bmi = round(user.weight / ((user.height/100) ** 2), 1)
-                print(f"   ├── BMI: {bmi}")
             if user.allergies and user.allergies != ['无']:
                 print(f"   ├── ⚠️ 过敏: {', '.join(user.allergies)}")
             if user.chronic_diseases and user.chronic_diseases != ['无']:
                 print(f"   └── ⚠️ 慢性病: {', '.join(user.chronic_diseases)}")
-            else:
-                print(f"   └── 无已知慢性病")
             print()
-            print("   ✅ 基础信息完整，直接进入症状描述")
+            print("   ✅ 基础信息完整，系统已自动分析最新身体指标")
     
     print()
     print("-" * 58)
@@ -190,6 +178,7 @@ def run_health_advisor(app, llm=None) -> str:
     
     current_stage = None
     question_count = 0
+    shown_metrics = False  # 标记：是否已展示过身体分析报告
     
     while True:
         # 获取当前问题
@@ -198,6 +187,30 @@ def run_health_advisor(app, llm=None) -> str:
         if not question:
             # 没有更多问题，尝试切换阶段
             continue_flag, msg, risk = consultation._advance_stage()
+            
+            # === 自动身体分析展示逻辑 ===
+            # 当“基础信息”阶段结束进入“病史”阶段时，说明有了身高体重，展示分析报告
+            cur_session = consultation.current_session
+            if cur_session.current_stage == QuestionStage.MEDICAL_HISTORY and not shown_metrics:
+                if cur_session.health_metrics:
+                    print()
+                    print("╔════════════════════════════════════════════╗")
+                    print("║  📊 您的身体状况分析报告                     ║")
+                    print("╠════════════════════════════════════════════╣")
+                    print(f"║  • BMI 指数 : {cur_session.health_metrics.get('BMI')} (标准:18.5-24)")
+                    print(f"║  • 基础代谢 : {cur_session.health_metrics.get('BMR')} kcal/天")
+                    print(f"║  • 理想体重 : {cur_session.health_metrics.get('IdealWeight')} kg")
+                    print("╠════════════════════════════════════════════╣")
+                    # 截断过长的评估文字
+                    assessment = cur_session.health_assessment or "暂无评估"
+                    if len(assessment) > 35:
+                         assessment = assessment[:32] + "..."
+                    print(f"║  💡 综合评价: {assessment}")
+                    print("╚════════════════════════════════════════════╝")
+                    print()
+                    input("按回车键继续补充病史...")
+                shown_metrics = True
+            # ==========================
             
             if msg:
                 print(f"\n{'─'*40}")
@@ -228,13 +241,13 @@ def run_health_advisor(app, llm=None) -> str:
             if answer.lower() in ['q', '/q']:
                 print("\n⚠️  问诊已中断，您的信息已保存。")
                 consultation.save_session()
-                consultation.generate_history_markdown()  # 生成Markdown
+                consultation.generate_history_markdown()
                 return "back_to_menu"
             
             if answer.lower() in ['qq', '/qq']:
                 print("\n👋 再见！您的信息已保存。")
                 consultation.save_session()
-                consultation.generate_history_markdown()  # 生成Markdown
+                consultation.generate_history_markdown()
                 return "exit_program"
             
             if not answer:
@@ -256,7 +269,7 @@ def run_health_advisor(app, llm=None) -> str:
             print("  ⚠️  本次咨询已结束，请立即就医！")
             print("!" * 58)
             consultation.save_session()
-            consultation.generate_history_markdown()  # 生成Markdown
+            consultation.generate_history_markdown()
             input("\n按回车键返回主菜单...")
             return "back_to_menu"
         
@@ -359,74 +372,68 @@ def run_health_advisor(app, llm=None) -> str:
 
 
 def _build_rag_query(summary: dict) -> str:
-    """根据问诊摘要构建RAG查询"""
+    """
+    根据问诊摘要构建RAG查询
+    更新：包含自动计算的身体指标
+    """
     parts = []
     
-    # 用户基本情况
+    # 1. 用户基本情况
     profile = summary.get("user_profile", {})
     if profile.get("gender") and profile.get("age"):
         parts.append(f"患者是{profile['age']}岁{profile['gender']}性")
     
-    # 包含具体身高体重和BMI（避免系统要求重新计算）
-    if profile.get("bmi"):
-        bmi = profile["bmi"]
-        parts.append(f"BMI为{bmi}")
-        if bmi >= 28:
-            parts.append("属于肥胖")
-        elif bmi >= 24:
-            parts.append("属于超重")
-        elif bmi < 18.5:
-            parts.append("属于偏瘦")
-        else:
-            parts.append("体重正常")
+    # 2. 身体指标（后端已计算好）
+    metrics = summary.get("health_metrics", {})
+    assessment = summary.get("health_assessment", "")
     
-    # 病史
+    if metrics:
+        # 如果有计算数据，直接放入Context
+        parts.append(f"BMI={metrics.get('BMI')}")
+        parts.append(f"BMR={metrics.get('BMR')}kcal/day")
+    
+    if assessment:
+        parts.append(f"身体状态评估：{assessment}")
+    
+    # 3. 病史
     if profile.get("chronic_diseases"):
         diseases = [d for d in profile["chronic_diseases"] if d and d != "无"]
         if diseases:
             parts.append(f"有{', '.join(diseases)}病史")
-        else:
-            parts.append("无慢性病史")
     
     if profile.get("allergies"):
         allergies = [a for a in profile["allergies"] if a and a != "无"]
         if allergies:
             parts.append(f"对{', '.join(allergies)}过敏")
-        else:
-            parts.append("无过敏史")
     
-    # 主诉（核心问题）
+    # 4. 主诉（核心问题）
     complaint = summary.get("current_complaint", {})
     chief = complaint.get("chief_complaint", "")
     if chief:
-        parts.append(f"今天咨询的主要问题是：{chief}")
+        parts.append(f"主要症状：{chief}")
     
     if complaint.get("duration"):
-        parts.append(f"症状持续{complaint['duration']}")
+        parts.append(f"持续{complaint['duration']}")
     
-    if complaint.get("severity"):
-        parts.append(f"自评严重程度{complaint['severity']}/10分")
-    
-    # 构建查询
+    # 构建上下文
     context = "，".join(parts) if parts else "用户咨询健康问题"
     
-    # 明确告诉系统这是科普咨询，不需要计算任何指标
+    # 构建最终 Prompt
     query = f"""
-【患者情况】
-{context}。
+【患者详细画像】
+{context}
 
 【咨询需求】
-请针对患者的主要问题「{chief}」提供健康建议：
+请结合患者的「身体指标(BMI/BMR)」和「主要症状」，提供健康建议：
 
-1. 可能的原因分析
-2. 日常调理和注意事项
-3. 饮食和作息建议
+1. 分析症状原因（请考虑体重/代谢因素的影响，如BMI{metrics.get('BMI', '未知')}）
+2. 针对主诉的改善建议
+3. 饮食和作息建议（基于BMR={metrics.get('BMR', '未知')}）
 4. 什么情况下需要就医
 
-【重要提示】
-- 这是健康科普咨询，不是诊断，请直接给出建议
-- 不需要计算BMI等指标，患者信息已经提供
-- 请用通俗易懂的语言，给出实用的建议
+【注意】
+- 语气亲切、专业
+- 不要重新计算BMI，直接使用提供的数据
 """
     return query
 
@@ -435,13 +442,10 @@ def _build_rag_query(summary: dict) -> str:
 # 用户登录（保留兼容）
 # ============================================================
 def user_login() -> tuple:
-    """
-    用户登录/注册流程（旧版，保留兼容）
-    """
+    """用户登录/注册流程（旧版，保留兼容）"""
     print("""
 ┌──────────────────────────────────────────────────────────┐
 │  👤 登录 / 注册                                          │
-│                                                          │
 │  老用户：输入你的ID                                       │
 │  新用户：按 Enter 创建账号                                │
 └──────────────────────────────────────────────────────────┘
@@ -464,21 +468,10 @@ def user_login() -> tuple:
             if retry != 'y':
                 return user_login()
     
-    # 新用户注册
     display_name = input("\n📝 输入你的名字: ").strip() or "用户"
     user_id = f"{display_name}_{uuid.uuid4().hex[:8]}"
     profile_store.create_user(user_id, display_name)
-    
-    print(f"""
-┌──────────────────────────────────────────────────────────┐
-│  ✅ 账号创建成功！                                        │
-│                                                          │
-│  👤 {display_name:<52}│
-│  🆔 {user_id:<52}│
-│                                                          │
-│  ⚠️  请记住你的ID，下次登录需要输入                        │
-└──────────────────────────────────────────────────────────┘
-""")
+    print(f"\n✅ 账号创建成功！ID: {user_id}\n")
     return user_id, display_name
 
 
@@ -489,35 +482,17 @@ def show_health_profile(user_id: str):
     """显示用户健康档案"""
     profile = load_health_profile(user_id)
     user_info = profile_store.get_user_info(user_id)
-    
     if profile:
-        print(f"""
-┌──────────────────────────────────────────────────────────┐
-│  📋 健康档案                                              │
-├──────────────────────────────────────────────────────────┤
-│  👤 {user_info['display_name'] if user_info else user_id:<52}│
-│  🆔 {user_id:<52}│
-└──────────────────────────────────────────────────────────┘
-
-{profile}
-""")
+        print(f"\n📋 健康档案 ({user_info['display_name'] if user_info else user_id})\n{profile}\n")
     else:
-        print("\n📋 健康档案为空，告诉我你的身高体重、过敏史等信息，我会记住。\n")
+        print("\n📋 健康档案为空\n")
 
 
 # ============================================================
 # 医学科普模式
 # ============================================================
 def run_science_qa(app) -> str:
-    """
-    运行医学科普问答模式
-    
-    Args:
-        app: 编译后的 LangGraph app
-    
-    Returns:
-        "exit_program" 或 "back_to_menu"
-    """
+    """运行医学科普问答模式"""
     thread_id = f"science_{uuid.uuid4().hex[:8]}"
     set_current_thread_id(thread_id)
     config = {"configurable": {"thread_id": thread_id}}
@@ -525,29 +500,17 @@ def run_science_qa(app) -> str:
     print(f"""
 {'━' * 58}
   📚 医学科普问答
-  
-  直接输入问题即可
-  /q 返回主菜单 | /qq 退出程序
-  
-  示例：什么是二区训练？/ 如何预防糖尿病？
+  直接输入问题即可 (/q 返回主菜单)
 {'━' * 58}
 """)
     
     while True:
         try:
             user_input = input("\n👉 ").strip()
+            if not user_input: continue
+            if user_input == "/qq": return "exit_program"
+            if user_input in ["/q", "q"]: return "back_to_menu"
             
-            if not user_input:
-                continue
-            
-            if user_input == "/qq":
-                print("\n👋 再见！")
-                return "exit_program"
-            
-            if user_input in ["/q", "q"]:
-                return "back_to_menu"
-            
-            # 处理问题（无用户ID，即无记忆）
             for event in app.stream(
                 {"messages": [HumanMessage(content=user_input)], "user_id": "anonymous"},
                 config
