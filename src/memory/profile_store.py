@@ -340,5 +340,5 @@ class ProfileStore:
         print(f"  ✅ 已同步 {len(users)} 个用户档案到Markdown")
 
 
-# 全局实例
-profile_store = ProfileStore()
+# 全局实例（禁用Markdown同步，现在使用user_data/目录的JSON存储）
+profile_store = ProfileStore(enable_markdown_sync=False)

@@ -377,5 +377,6 @@ class UserProfileMarkdown:
         return index_path
 
 
-# 全局实例
-user_profile_md = UserProfileMarkdown()
+# 不再创建全局实例，避免自动生成user_profiles目录
+# 如需使用，请手动实例化：UserProfileMarkdown()
+# user_profile_md = UserProfileMarkdown()
