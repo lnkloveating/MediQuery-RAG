@@ -14,7 +14,7 @@ from tools import medical_tools_list
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
 
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch as TavilySearchResults
 
 # --- 1. 基础配置 ---
 DB_PATH = "./medical_db"

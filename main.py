@@ -56,7 +56,7 @@ def main():
         choice = input("请选择 [1/2] (q退出): ").strip()
         
         if choice == "1":
-            result = run_health_advisor(app)
+            result = run_health_advisor(app, llm=llm)
             if result == "exit_program":
                 break
             print()
