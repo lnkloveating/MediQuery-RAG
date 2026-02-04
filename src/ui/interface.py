@@ -227,13 +227,13 @@ def run_health_advisor(app) -> str:
             if answer.lower() in ['q', '/q']:
                 print("\n⚠️  问诊已中断，您的信息已保存。")
                 consultation.save_session()
-                consultation.generate_history_markdown()
+                consultation.generate_history_markdown()  # 生成Markdown
                 return "back_to_menu"
             
             if answer.lower() in ['qq', '/qq']:
                 print("\n👋 再见！您的信息已保存。")
                 consultation.save_session()
-                consultation.generate_history_markdown()
+                consultation.generate_history_markdown()  # 生成Markdown
                 return "exit_program"
             
             if not answer:
@@ -255,7 +255,7 @@ def run_health_advisor(app) -> str:
             print("  ⚠️  本次咨询已结束，请立即就医！")
             print("!" * 58)
             consultation.save_session()
-            consultation.generate_history_markdown()
+            consultation.generate_history_markdown()  # 生成Markdown
             input("\n按回车键返回主菜单...")
             return "back_to_menu"
         
@@ -366,45 +366,66 @@ def _build_rag_query(summary: dict) -> str:
     if profile.get("gender") and profile.get("age"):
         parts.append(f"患者是{profile['age']}岁{profile['gender']}性")
     
+    # 包含具体身高体重和BMI（避免系统要求重新计算）
     if profile.get("bmi"):
         bmi = profile["bmi"]
+        parts.append(f"BMI为{bmi}")
         if bmi >= 28:
-            parts.append("体重偏胖(BMI={})".format(bmi))
+            parts.append("属于肥胖")
+        elif bmi >= 24:
+            parts.append("属于超重")
         elif bmi < 18.5:
-            parts.append("体重偏瘦(BMI={})".format(bmi))
+            parts.append("属于偏瘦")
+        else:
+            parts.append("体重正常")
     
     # 病史
     if profile.get("chronic_diseases"):
-        diseases = [d for d in profile["chronic_diseases"] if d != "无"]
+        diseases = [d for d in profile["chronic_diseases"] if d and d != "无"]
         if diseases:
             parts.append(f"有{', '.join(diseases)}病史")
+        else:
+            parts.append("无慢性病史")
     
     if profile.get("allergies"):
-        allergies = [a for a in profile["allergies"] if a != "无"]
+        allergies = [a for a in profile["allergies"] if a and a != "无"]
         if allergies:
             parts.append(f"对{', '.join(allergies)}过敏")
+        else:
+            parts.append("无过敏史")
     
-    # 主诉
+    # 主诉（核心问题）
     complaint = summary.get("current_complaint", {})
-    if complaint.get("chief_complaint"):
-        parts.append(f"目前的问题是：{complaint['chief_complaint']}")
+    chief = complaint.get("chief_complaint", "")
+    if chief:
+        parts.append(f"今天咨询的主要问题是：{chief}")
     
     if complaint.get("duration"):
         parts.append(f"症状持续{complaint['duration']}")
     
+    if complaint.get("severity"):
+        parts.append(f"自评严重程度{complaint['severity']}/10分")
+    
     # 构建查询
     context = "，".join(parts) if parts else "用户咨询健康问题"
     
+    # 明确告诉系统这是科普咨询，不需要计算任何指标
     query = f"""
+【患者情况】
 {context}。
 
-请根据以上情况，提供健康建议，包括：
-1. 可能的原因分析
-2. 日常注意事项  
-3. 饮食和运动建议
-4. 是否需要进一步检查
+【咨询需求】
+请针对患者的主要问题「{chief}」提供健康建议：
 
-注意：这是健康科普建议，不是医疗诊断。请用通俗易懂的语言回答。
+1. 可能的原因分析
+2. 日常调理和注意事项
+3. 饮食和作息建议
+4. 什么情况下需要就医
+
+【重要提示】
+- 这是健康科普咨询，不是诊断，请直接给出建议
+- 不需要计算BMI等指标，患者信息已经提供
+- 请用通俗易懂的语言，给出实用的建议
 """
     return query
 

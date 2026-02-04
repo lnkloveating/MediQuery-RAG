@@ -21,13 +21,25 @@ def detect_mode(user_input: str) -> str:
         "assessment" 或 "science"
     """
     input_lower = user_input.lower()
+    
+    # 如果明确标记为科普咨询，直接返回science模式
+    # 这是结构化问诊生成的查询，不需要计算BMI等
+    if "【咨询需求】" in user_input or "不需要计算" in user_input:
+        return "science"
+    
     has_numbers = any(char.isdigit() for char in user_input)
     
     assessment_score = sum(1 for kw in ASSESSMENT_KEYWORDS if kw in input_lower)
     science_score = sum(1 for kw in SCIENCE_KEYWORDS if kw in input_lower)
     
-    if has_numbers or assessment_score > 0:
+    # 只有明确要求计算时才进入assessment模式
+    # 比如 "计算BMI"、"帮我算一下"
+    calc_keywords = ["计算", "算一下", "帮我算", "多少"]
+    has_calc_request = any(kw in input_lower for kw in calc_keywords)
+    
+    if has_calc_request and (has_numbers or assessment_score > 0):
         return "assessment"
+    
     return "science"
 
 
