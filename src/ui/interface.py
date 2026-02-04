@@ -185,7 +185,8 @@ def run_health_advisor(app, llm=None) -> str:
     stage_names = {
         QuestionStage.BASIC_INFO: "📊 基础信息采集",
         QuestionStage.MEDICAL_HISTORY: "📋 病史信息采集", 
-        QuestionStage.CURRENT_SYMPTOMS: "🩺 当前症状描述",
+        QuestionStage.CONSULTATION_TYPE: "🎯 咨询目的选择",
+        QuestionStage.CURRENT_SYMPTOMS: "🩺 症状描述",
     }
     
     current_stage = None
@@ -365,20 +366,32 @@ def _build_rag_query(summary: dict) -> str:
     # 用户基本情况
     profile = summary.get("user_profile", {})
     if profile.get("gender") and profile.get("age"):
-        parts.append(f"患者是{profile['age']}岁{profile['gender']}性")
+        parts.append(f"患者是{int(profile['age'])}岁{profile['gender']}性")
     
-    # 包含具体身高体重和BMI（避免系统要求重新计算）
-    if profile.get("bmi"):
-        bmi = profile["bmi"]
-        parts.append(f"BMI为{bmi}")
-        if bmi >= 28:
-            parts.append("属于肥胖")
-        elif bmi >= 24:
-            parts.append("属于超重")
-        elif bmi < 18.5:
-            parts.append("属于偏瘦")
-        else:
-            parts.append("体重正常")
+    # 身体指标
+    metrics = summary.get("health_metrics", {})
+    if metrics:
+        if metrics.get("BMI"):
+            bmi = metrics["BMI"]
+            parts.append(f"BMI为{bmi}")
+            if bmi >= 28:
+                parts.append("属于肥胖")
+            elif bmi >= 24:
+                parts.append("属于超重")
+            elif bmi < 18.5:
+                parts.append("属于偏瘦")
+            else:
+                parts.append("体重正常")
+        
+        if metrics.get("BMR"):
+            parts.append(f"基础代谢率{metrics['BMR']}kcal/天")
+        
+        if metrics.get("IdealWeight"):
+            parts.append(f"理想体重约{metrics['IdealWeight']}kg")
+    
+    # AI身体评估
+    if summary.get("health_assessment"):
+        parts.append(f"身体状况评估：{summary['health_assessment']}")
     
     # 病史
     if profile.get("chronic_diseases"):
@@ -395,28 +408,47 @@ def _build_rag_query(summary: dict) -> str:
         else:
             parts.append("无过敏史")
     
-    # 主诉（核心问题）
-    complaint = summary.get("current_complaint", {})
-    chief = complaint.get("chief_complaint", "")
-    if chief:
-        parts.append(f"今天咨询的主要问题是：{chief}")
-    
-    if complaint.get("duration"):
-        parts.append(f"症状持续{complaint['duration']}")
-    
-    if complaint.get("severity"):
-        parts.append(f"自评严重程度{complaint['severity']}/10分")
-    
     # 构建查询
     context = "，".join(parts) if parts else "用户咨询健康问题"
     
-    # 明确告诉系统这是科普咨询，不需要计算任何指标
-    query = f"""
-【患者情况】
+    # 根据咨询类型生成不同的查询
+    consultation_type = summary.get("consultation_type", "")
+    complaint = summary.get("current_complaint", {})
+    chief = complaint.get("chief_complaint", "")
+    
+    if consultation_type == "health_management":
+        # 健康管理建议模式
+        query = f"""
+【用户情况】
 {context}。
 
 【咨询需求】
-请针对患者的主要问题「{chief}」提供健康建议：
+用户希望获得健康管理建议，请提供：
+
+1. 根据BMI和基础代谢的体重管理建议
+2. 适合该用户的饮食建议（每日热量摄入参考）
+3. 运动建议（类型、频率、强度）
+4. 生活习惯调整建议
+5. 定期检查建议
+
+【重要提示】
+- 这是健康管理咨询，不是诊断
+- 请结合用户的身体指标给出个性化建议
+- 用通俗易懂的语言
+"""
+    else:
+        # 症状咨询模式
+        query = f"""
+【患者情况】
+{context}。
+
+【症状描述】
+主诉：{chief}
+持续时间：{complaint.get('duration', '未知')}
+严重程度：{complaint.get('severity', '未知')}/10分
+
+【咨询需求】
+请针对患者的症状「{chief}」提供健康建议：
 
 1. 可能的原因分析
 2. 日常调理和注意事项
@@ -428,6 +460,7 @@ def _build_rag_query(summary: dict) -> str:
 - 不需要计算BMI等指标，患者信息已经提供
 - 请用通俗易懂的语言，给出实用的建议
 """
+    
     return query
 
 
