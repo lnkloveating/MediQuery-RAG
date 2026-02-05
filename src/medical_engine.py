@@ -4,8 +4,19 @@
 import sys
 import os
 
+# 确保找到项目根目录的 .env 文件
+from pathlib import Path
+project_root = Path(__file__).parent.parent  
+env_path = project_root / ".env"
+
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=env_path)
+
+# 检查 Tavily API Key
+tavily_key = os.getenv("TAVILY_API_KEY")
+if not tavily_key:
+    print("⚠️  警告：未设置 TAVILY_API_KEY，联网搜索将不可用")
+    print(f"   请在 {env_path} 中添加: TAVILY_API_KEY=你的密钥")
 
 # 导入工具列表，用于绑定给模型
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +25,8 @@ from tools import medical_tools_list
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
 
-from langchain_tavily import TavilySearch as TavilySearchResults
+# 导入 Tavily
+from langchain_tavily import TavilySearch
 
 # --- 1. 基础配置 ---
 DB_PATH = "./medical_db"
@@ -39,7 +51,13 @@ llm_with_tools = llm.bind_tools(medical_tools_list)
 # 连接数据库
 vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
 
-web_search_tool = TavilySearchResults(k=3)
+# 初始化 Web 搜索工具
+if tavily_key:
+    web_search_tool = TavilySearch(max_results=3)
+    print("✅ Tavily 联网搜索已启用")
+else:
+    web_search_tool = None
+    print("ℹ️  联网搜索未启用（缺少 TAVILY_API_KEY）")
 
 # --- 3. 封装通用功能 ---
 

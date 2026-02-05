@@ -104,12 +104,34 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
         print("🌐 [联网搜索...]")
         question = state["messages"][-1].content
         
+        # 检查工具是否可用
+        if web_search_tool is None:
+            print("  ⚠️ 联网搜索未配置")
+            return {"documents": ["⚠️ 联网搜索未配置，请设置 TAVILY_API_KEY"], "used_web_search": True}
+        
         try:
-            results = web_search_tool.invoke({"query": question})
-            web_contents = [res['content'] for res in results]
+            results = web_search_tool.invoke(question)
+            
+            # 处理不同的返回格式
+            web_contents = []
+            if isinstance(results, list):
+                for res in results:
+                    if isinstance(res, dict):
+                        content = res.get('content') or res.get('snippet') or str(res)
+                        web_contents.append(content)
+                    else:
+                        web_contents.append(str(res))
+            elif isinstance(results, str):
+                web_contents = [results]
+            else:
+                web_contents = [str(results)]
+            
+            if web_contents:
+                print(f"  ✅ 找到 {len(web_contents)} 条结果")
             return {"documents": web_contents, "used_web_search": True}
         except Exception as e:
-            return {"documents": ["⚠️ 网络搜索暂时不可用"], "used_web_search": True}
+            print(f"  ❌ 搜索出错: {e}")
+            return {"documents": [f"⚠️ 网络搜索出错: {str(e)}"], "used_web_search": True}
     
     def grade_and_generate_node(state):
         """评分与生成节点 - 评估文档并生成回答"""
