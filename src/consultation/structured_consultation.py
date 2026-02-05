@@ -3,6 +3,7 @@
 - 集成自动身体指标计算与评估
 - 咨询目的分流（健康管理 vs 身体不适）
 - 多轮智能追问（最多3轮，由大模型决定是否追问及追问内容）
+- 使用消息列表维护追问对话历史（真正的短期记忆）
 """
 
 import os
@@ -13,6 +14,18 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from dataclasses import dataclass, field, asdict
+
+# 导入 LangChain 消息类型
+try:
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+except ImportError:
+    # 如果没有安装，使用简单的字典替代
+    class SystemMessage:
+        def __init__(self, content): self.content = content
+    class HumanMessage:
+        def __init__(self, content): self.content = content
+    class AIMessage:
+        def __init__(self, content): self.content = content
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,45 +73,35 @@ RISK_ASSESSMENT_PROMPT = """你是一名经验丰富的急诊分诊护士，需�
 请直接输出JSON格式（不要任何其他内容）：
 {{"risk_level": "CRITICAL/HIGH/MEDIUM/LOW", "reason": "简短判断理由", "advice": "给患者的建议"}}"""
 
-# 大模型追问决策 Prompt
-FOLLOWUP_DECISION_PROMPT = """你是一名专业的问诊医生。
+# 大模型追问系统提示（用于消息列表的第一条）
+FOLLOWUP_SYSTEM_PROMPT = """你是一名专业的问诊医生，正在通过对话收集患者的症状信息。
 
 【患者基本信息】
 - 年龄：{age}岁
 - 性别：{gender}
 - 慢性病史：{chronic_diseases}
 
-【已收集的症状信息】
-{collected_info}
+【你的任务】
+根据对话历史，判断是否还需要追问才能给出有效的健康建议。
 
-【任务】
-判断是否还需要追问才能给出有效的健康建议。
-
-【重要规则】
-1. 每次只问一个问题，不要一次问多个问题
-2. 问题要简短明确，不超过20个字
-3. 如果提供选项，最多4个选项
-4. 不要重复问已经收集到的信息
-5. 最多追问3轮，如果信息已经足够就不要再追问
+【严格规则】
+1. 仔细阅读对话历史，绝对不能重复问已经问过或患者已经回答过的信息
+2. 每次只问一个问题，不超过15个字
+3. 如果提供选项，最多4个，不要包含患者已经说过的内容
+4. 以下信息如果已在对话中出现，不要再问：
+   - 疼痛/不适的位置
+   - 疼痛/不适的性质
+   - 持续时间
+   - 伴随症状（如发热、呕吐等）
 
 【判断标准】
-- 如果症状描述清晰具体（如"左侧太阳穴跳痛"），不需要追问
-- 如果缺少关键信息（如疼痛位置、性质），需要追问
-- 如果已经追问过的信息，不要再问
+- 如果对话中已有2条以上详细信息 → 不需要追问
+- 如果缺少关键信息 → 需要追问
+- 最多追问3轮
 
 【输出格式】
-请直接输出JSON（不要任何其他内容）：
-{{
-    "need_followup": true或false,
-    "question": "简短的追问问题（不超过20字）",
-    "options": ["选项1", "选项2", "选项3", "选项4"]或null,
-    "reason": "追问原因（简短）"
-}}
-
-示例输出：
-{{"need_followup": true, "question": "头痛在什么位置？", "options": ["前额", "太阳穴", "后脑勺", "整个头"], "reason": "需要确定疼痛位置"}}
-{{"need_followup": true, "question": "是什么样的疼法？", "options": ["跳痛", "胀痛", "刺痛", "闷痛"], "reason": "需要了解疼痛性质"}}
-{{"need_followup": false, "question": "", "options": null, "reason": "信息已足够"}}"""
+直接输出JSON，不要其他内容：
+{{"need_followup": true或false, "question": "简短问题", "options": ["选项1", "选项2"]或null, "reason": "原因"}}"""
 
 
 class RiskLevel(str, Enum):
@@ -163,6 +166,7 @@ class ConsultationSession:
     followup_count: int = 0  # 已追问次数
     followup_qa: List[Dict] = field(default_factory=list)  # 追问问答记录
     current_followup_question: Dict = field(default_factory=dict)  # 当前追问问题
+    followup_messages: List[Dict] = field(default_factory=list)  # 追问对话消息列表（用于LLM记忆）
     
     # 评估结果
     risk_level: str = ""
@@ -510,9 +514,25 @@ class StructuredConsultation:
                     session.current_followup_question = followup_question
                     return True, None, None
             
-            # AI追问结束，清空当前追问问题，开始问固定的持续时间/严重程度问题
+            # AI追问结束，检查是否需要问固定问题
             session.current_followup_question = {}
-            self.current_question_index = 0  # 重置索引，开始问FOLLOWUP阶段的固定问题
+            
+            # 检查AI追问是否已经收集了持续时间和严重程度相关信息
+            has_duration = self._check_if_collected("持续", "多久", "多长时间", "几天", "几小时")
+            has_severity = self._check_if_collected("严重", "程度", "几分", "打分")
+            
+            # 如果两者都已收集，直接进入评估
+            if has_duration and has_severity:
+                session.current_stage = QuestionStage.ASSESSMENT
+                return self._do_final_assessment()
+            
+            # 否则开始问缺失的固定问题
+            self.current_question_index = 0
+            
+            # 跳过已收集的问题
+            if has_duration:
+                self.current_question_index = 1  # 跳过持续时间，直接问严重程度
+            
             return True, "✅ 好的，再问您几个问题就完成了", None
         
         # 处理固定问题（持续时间、严重程度）
@@ -542,36 +562,56 @@ class StructuredConsultation:
         session.current_stage = QuestionStage.ASSESSMENT
         return self._do_final_assessment()
     
+    def _check_if_collected(self, *keywords) -> bool:
+        """检查AI追问是否已经收集了某类信息"""
+        session = self.current_session
+        if not session or not session.followup_qa:
+            return False
+        
+        # 检查追问的问题和答案中是否包含关键词
+        for qa in session.followup_qa:
+            question_text = qa.get("question", "").lower()
+            answer_text = qa.get("answer", "").lower()
+            for kw in keywords:
+                if kw in question_text or kw in answer_text:
+                    return True
+        return False
+    
     def _check_need_followup(self) -> Tuple[bool, Optional[Dict]]:
-        """检查是否需要追问，并生成追问问题"""
+        """检查是否需要追问，并生成追问问题（使用消息列表维护对话记忆）"""
         if not self.llm:
             return False, None
         
         user = self.current_user
         session = self.current_session
         
-        # 构建已收集信息（清晰列出每一条）
-        collected_info = []
-        if session.chief_complaint:
-            collected_info.append(f"• 主诉: {session.chief_complaint}")
-        
-        # 列出已追问的问答
-        for i, qa in enumerate(session.followup_qa, 1):
-            collected_info.append(f"• 追问{i}: {qa['question']}")
-            collected_info.append(f"  回答: {qa['answer']}")
-        
-        collected_str = "\n".join(collected_info) if collected_info else "仅有主诉，无其他信息"
-        
-        prompt = FOLLOWUP_DECISION_PROMPT.format(
+        # 构建系统提示
+        system_prompt = FOLLOWUP_SYSTEM_PROMPT.format(
             age=int(user.age) if user.age else "未知",
             gender=user.gender or "未知",
-            chronic_diseases=", ".join(user.chronic_diseases) if user.chronic_diseases else "无",
-            collected_info=collected_str
+            chronic_diseases=", ".join(user.chronic_diseases) if user.chronic_diseases else "无"
         )
+        
+        # 构建消息列表
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # 添加主诉作为第一条用户消息
+        if session.chief_complaint:
+            messages.append(HumanMessage(content=f"我的症状是：{session.chief_complaint}"))
+        
+        # 添加已有的追问对话历史
+        for qa in session.followup_qa:
+            # AI的追问
+            messages.append(AIMessage(content=qa["question"]))
+            # 用户的回答
+            messages.append(HumanMessage(content=qa["answer"]))
+        
+        # 添加请求判断的提示
+        messages.append(HumanMessage(content="请根据以上对话，判断是否需要继续追问。输出JSON格式。"))
         
         try:
             print("  🤔 [AI正在判断是否需要追问...]")
-            response = self.llm.invoke(prompt).content.strip()
+            response = self.llm.invoke(messages).content.strip()
             
             # 清理markdown
             if "```" in response:
@@ -942,6 +982,145 @@ class StructuredConsultation:
                 "llm_reason": self.current_session.llm_risk_reason,
             }
         }
+    
+    def get_history_summary(self, max_sessions: int = 3) -> Optional[str]:
+        """
+        获取用户历史问诊摘要
+        
+        Args:
+            max_sessions: 最多读取几次历史记录
+        
+        Returns:
+            历史摘要字符串，如果没有历史则返回None
+        """
+        if not self.current_user:
+            return None
+        
+        user_dir = self._get_user_dir(self.current_user.user_id)
+        sessions_dir = os.path.join(user_dir, "sessions")
+        
+        if not os.path.exists(sessions_dir):
+            return None
+        
+        # 获取历史session文件（按时间倒序，排除当前session）
+        session_files = sorted(os.listdir(sessions_dir), reverse=True)
+        current_session_id = self.current_session.session_id if self.current_session else ""
+        
+        # 过滤掉当前session
+        history_files = [f for f in session_files if not f.startswith(current_session_id)]
+        
+        if not history_files:
+            return None
+        
+        # 读取最近的几次历史
+        history_records = []
+        for sf in history_files[:max_sessions]:
+            session_path = os.path.join(sessions_dir, sf)
+            try:
+                with open(session_path, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
+                
+                # 提取关键信息
+                record = {
+                    "time": session_data.get("start_time", "未知时间"),
+                    "type": "健康管理" if session_data.get("consultation_type") == "health_management" else "症状咨询",
+                    "chief_complaint": session_data.get("chief_complaint", ""),
+                    "risk_level": session_data.get("risk_level", ""),
+                    "followup_qa": session_data.get("followup_qa", []),
+                    "duration": session_data.get("symptom_duration", ""),
+                    "severity": session_data.get("symptom_severity", ""),
+                }
+                
+                if record["chief_complaint"]:  # 只保留有主诉的记录
+                    history_records.append(record)
+            except:
+                continue
+        
+        if not history_records:
+            return None
+        
+        # 生成摘要
+        summary_parts = ["【历史问诊记录】"]
+        
+        for i, record in enumerate(history_records, 1):
+            parts = [f"\n{i}. {record['time']} [{record['type']}]"]
+            parts.append(f"   主诉: {record['chief_complaint']}")
+            
+            # 添加追问详情
+            if record['followup_qa']:
+                details = []
+                for qa in record['followup_qa'][:2]:  # 最多显示2条追问
+                    details.append(f"{qa.get('question', '')}: {qa.get('answer', '')}")
+                if details:
+                    parts.append(f"   详情: {'; '.join(details)}")
+            
+            if record['duration']:
+                parts.append(f"   持续: {record['duration']}")
+            
+            if record['risk_level']:
+                risk_label = {"low": "低", "medium": "中", "high": "高", "critical": "危急"}.get(record['risk_level'], record['risk_level'])
+                parts.append(f"   风险: {risk_label}")
+            
+            summary_parts.append("".join(parts))
+        
+        return "\n".join(summary_parts)
+    
+    def has_similar_history(self, current_complaint: str) -> Optional[Dict]:
+        """
+        检查是否有相似的历史问诊
+        
+        Returns:
+            如果有相似记录，返回该记录；否则返回None
+        """
+        if not self.current_user or not current_complaint:
+            return None
+        
+        user_dir = self._get_user_dir(self.current_user.user_id)
+        sessions_dir = os.path.join(user_dir, "sessions")
+        
+        if not os.path.exists(sessions_dir):
+            return None
+        
+        # 提取当前主诉的关键词
+        current_keywords = set(current_complaint)
+        
+        # 简单的关键词匹配
+        symptom_keywords = ["头痛", "头疼", "胸闷", "胸痛", "肚子疼", "腹痛", "咳嗽", 
+                          "发烧", "感冒", "失眠", "头晕", "恶心", "呕吐", "腰痛"]
+        
+        current_symptoms = [kw for kw in symptom_keywords if kw in current_complaint]
+        
+        if not current_symptoms:
+            return None
+        
+        # 搜索历史记录
+        session_files = sorted(os.listdir(sessions_dir), reverse=True)
+        current_session_id = self.current_session.session_id if self.current_session else ""
+        
+        for sf in session_files[:10]:  # 最多检查10条历史
+            if sf.startswith(current_session_id):
+                continue
+            
+            session_path = os.path.join(sessions_dir, sf)
+            try:
+                with open(session_path, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
+                
+                history_complaint = session_data.get("chief_complaint", "")
+                
+                # 检查历史记录是否有相同症状
+                for symptom in current_symptoms:
+                    if symptom in history_complaint:
+                        return {
+                            "time": session_data.get("start_time", ""),
+                            "complaint": history_complaint,
+                            "matching_symptom": symptom,
+                            "risk_level": session_data.get("risk_level", ""),
+                        }
+            except:
+                continue
+        
+        return None
     
     def generate_history_markdown(self) -> str:
         if not self.current_user:
