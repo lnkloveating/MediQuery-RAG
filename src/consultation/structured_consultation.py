@@ -1,7 +1,8 @@
 """
-结构化问诊模块 - 升级版 v2
+结构化问诊模块 - 升级版 v3
 - 集成自动身体指标计算与评估
-- 新增咨询目的分流（健康管理 vs 身体不适）
+- 咨询目的分流（健康管理 vs 身体不适）
+- 多轮智能追问（最多3轮，由大模型决定是否追问及追问内容）
 """
 
 import os
@@ -23,6 +24,7 @@ from tools import PURE_CALC_TOOLS
 # 配置
 # ============================================================
 USER_DATA_DIR = os.path.join(BASE_DIR, "user_data")
+MAX_FOLLOWUP_ROUNDS = 3  # 最多追问轮数
 
 # 极端情况关键词 - 硬规则
 EMERGENCY_KEYWORDS = [
@@ -58,6 +60,46 @@ RISK_ASSESSMENT_PROMPT = """你是一名经验丰富的急诊分诊护士，需�
 请直接输出JSON格式（不要任何其他内容）：
 {{"risk_level": "CRITICAL/HIGH/MEDIUM/LOW", "reason": "简短判断理由", "advice": "给患者的建议"}}"""
 
+# 大模型追问决策 Prompt
+FOLLOWUP_DECISION_PROMPT = """你是一名专业的问诊医生。
+
+【患者基本信息】
+- 年龄：{age}岁
+- 性别：{gender}
+- 慢性病史：{chronic_diseases}
+
+【已收集的症状信息】
+{collected_info}
+
+【任务】
+判断是否还需要追问才能给出有效的健康建议。
+
+【重要规则】
+1. 每次只问一个问题，不要一次问多个问题
+2. 问题要简短明确，不超过20个字
+3. 如果提供选项，最多4个选项
+4. 不要重复问已经收集到的信息
+5. 最多追问3轮，如果信息已经足够就不要再追问
+
+【判断标准】
+- 如果症状描述清晰具体（如"左侧太阳穴跳痛"），不需要追问
+- 如果缺少关键信息（如疼痛位置、性质），需要追问
+- 如果已经追问过的信息，不要再问
+
+【输出格式】
+请直接输出JSON（不要任何其他内容）：
+{{
+    "need_followup": true或false,
+    "question": "简短的追问问题（不超过20字）",
+    "options": ["选项1", "选项2", "选项3", "选项4"]或null,
+    "reason": "追问原因（简短）"
+}}
+
+示例输出：
+{{"need_followup": true, "question": "头痛在什么位置？", "options": ["前额", "太阳穴", "后脑勺", "整个头"], "reason": "需要确定疼痛位置"}}
+{{"need_followup": true, "question": "是什么样的疼法？", "options": ["跳痛", "胀痛", "刺痛", "闷痛"], "reason": "需要了解疼痛性质"}}
+{{"need_followup": false, "question": "", "options": null, "reason": "信息已足够"}}"""
+
 
 class RiskLevel(str, Enum):
     CRITICAL = "critical"
@@ -70,17 +112,17 @@ class QuestionStage(str, Enum):
     IDENTIFICATION = "identification"
     BASIC_INFO = "basic_info"
     MEDICAL_HISTORY = "medical_history"
-    CONSULTATION_TYPE = "consultation_type"  # 新增：咨询目的选择
+    CONSULTATION_TYPE = "consultation_type"
     CURRENT_SYMPTOMS = "current_symptoms"
+    FOLLOWUP = "followup"  # 新增：追问阶段
     ASSESSMENT = "assessment"
     ADVICE = "advice"
     COMPLETED = "completed"
 
 
 class ConsultationType(str, Enum):
-    """咨询类型"""
-    HEALTH_MANAGEMENT = "health_management"  # 健康管理（减肥、养生等）
-    SYMPTOM_CONSULTATION = "symptom_consultation"  # 身体不适咨询
+    HEALTH_MANAGEMENT = "health_management"
+    SYMPTOM_CONSULTATION = "symptom_consultation"
 
 
 @dataclass
@@ -107,15 +149,20 @@ class ConsultationSession:
     end_time: str = ""
     current_stage: QuestionStage = QuestionStage.IDENTIFICATION
     
-    # 新增：咨询类型
-    consultation_type: str = ""  # health_management 或 symptom_consultation
+    # 咨询类型
+    consultation_type: str = ""
     
-    # 症状信息（仅身体不适咨询时使用）
+    # 症状信息
     chief_complaint: str = ""
     symptom_location: str = ""
     symptom_duration: str = ""
     symptom_severity: str = ""
     symptom_description: str = ""
+    
+    # 多轮追问记录
+    followup_count: int = 0  # 已追问次数
+    followup_qa: List[Dict] = field(default_factory=list)  # 追问问答记录
+    current_followup_question: Dict = field(default_factory=dict)  # 当前追问问题
     
     # 评估结果
     risk_level: str = ""
@@ -187,7 +234,6 @@ QUESTIONS = {
             "placeholder": "例如：降压药、降糖药"
         },
     ],
-    # 新增：咨询目的选择
     QuestionStage.CONSULTATION_TYPE: [
         {
             "field": "consultation_type",
@@ -205,17 +251,21 @@ QUESTIONS = {
             "field": "chief_complaint",
             "question": "请简单描述一下您哪里不舒服？",
             "type": "text",
-            "important": True
+            "important": True,
+            "triggers_followup": True  # 标记：回答后触发追问判断
         },
+    ],
+    # 追问结束后的补充问题
+    QuestionStage.FOLLOWUP: [
         {
             "field": "symptom_duration",
-            "question": "这个症状/问题持续多长时间了？",
+            "question": "这个症状持续多长时间了？",
             "options": ["今天刚开始", "1-3天", "一周左右", "一个月以上", "很长时间了"],
             "type": "choice"
         },
         {
             "field": "symptom_severity",
-            "question": "如果用1-10分表示严重程度（1最轻，10最重），您给自己的症状打几分？",
+            "question": "如果用1-10分表示严重程度（1最轻，10最重），您给自己打几分？",
             "type": "number",
             "validation": {"min": 1, "max": 10}
         },
@@ -309,10 +359,8 @@ class StructuredConsultation:
         now = datetime.now()
         session_id = now.strftime("%Y%m%d_%H%M%S")
         
-        # 决定从哪个阶段开始
         if self.has_complete_profile():
-            start_stage = QuestionStage.CONSULTATION_TYPE  # 老用户直接选咨询目的
-            # 老用户直接计算指标
+            start_stage = QuestionStage.CONSULTATION_TYPE
             session = ConsultationSession(
                 session_id=session_id,
                 user_id=self.current_user.user_id,
@@ -352,6 +400,18 @@ class StructuredConsultation:
             return None
         
         stage = self.current_session.current_stage
+        
+        # 如果在追问阶段
+        if stage == QuestionStage.FOLLOWUP:
+            # 优先返回AI生成的追问问题
+            if self.current_session.current_followup_question:
+                return self.current_session.current_followup_question
+            # 否则返回固定的持续时间/严重程度问题
+            followup_questions = QUESTIONS.get(QuestionStage.FOLLOWUP, [])
+            if self.current_question_index < len(followup_questions):
+                return followup_questions[self.current_question_index]
+            return None
+        
         if stage not in QUESTIONS:
             return None
         
@@ -372,15 +432,21 @@ class StructuredConsultation:
         # 记录对话
         self.current_session.conversation.append({
             "role": "assistant",
-            "content": question["question"]
+            "content": question.get("question", "")
         })
         self.current_session.conversation.append({
             "role": "user",
             "content": answer
         })
         
+        stage = self.current_session.current_stage
+        
+        # 处理追问阶段的回答
+        if stage == QuestionStage.FOLLOWUP:
+            return self._process_followup_answer(answer)
+        
         # 验证并存储答案
-        field_name = question["field"]
+        field_name = question.get("field", "")
         validated_answer = self._validate_answer(question, answer)
         
         if validated_answer is None:
@@ -389,7 +455,7 @@ class StructuredConsultation:
         # 存储到相应位置
         self._store_answer(field_name, validated_answer, question)
         
-        # 实时风险检测（仅针对症状描述）
+        # 实时风险检测
         if question.get("important"):
             risk_level, risk_msg = self._assess_risk_realtime(answer)
             if risk_level == RiskLevel.CRITICAL:
@@ -398,15 +464,152 @@ class StructuredConsultation:
                 self.save_session()
                 return False, risk_msg, risk_level
         
+        # 检查是否需要触发追问
+        if question.get("triggers_followup") and self.llm:
+            should_followup, followup_question = self._check_need_followup()
+            if should_followup and followup_question:
+                self.current_session.current_stage = QuestionStage.FOLLOWUP
+                self.current_session.current_followup_question = followup_question
+                return True, "🤔 我需要了解更多信息...", None
+        
         # 移动到下一个问题
         self.current_question_index += 1
         
         # 检查是否完成当前阶段
-        stage = self.current_session.current_stage
         if self.current_question_index >= len(QUESTIONS.get(stage, [])):
             return self._advance_stage()
         
         return True, None, None
+    
+    def _process_followup_answer(self, answer: str) -> Tuple[bool, Optional[str], Optional[RiskLevel]]:
+        """处理追问回答"""
+        session = self.current_session
+        question = self.get_current_question()
+        
+        # 如果是AI生成的追问（current_followup_question不为空）
+        if session.current_followup_question:
+            # 记录追问问答
+            session.followup_qa.append({
+                "question": session.current_followup_question.get("question", ""),
+                "answer": answer
+            })
+            session.followup_count += 1
+            
+            # 风险检测
+            risk_level, risk_msg = self._assess_risk_realtime(answer)
+            if risk_level == RiskLevel.CRITICAL:
+                session.risk_level = risk_level.value
+                session.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.save_session()
+                return False, risk_msg, risk_level
+            
+            # 检查是否需要继续追问
+            if session.followup_count < MAX_FOLLOWUP_ROUNDS and self.llm:
+                should_followup, followup_question = self._check_need_followup()
+                if should_followup and followup_question:
+                    session.current_followup_question = followup_question
+                    return True, None, None
+            
+            # AI追问结束，清空当前追问问题，开始问固定的持续时间/严重程度问题
+            session.current_followup_question = {}
+            self.current_question_index = 0  # 重置索引，开始问FOLLOWUP阶段的固定问题
+            return True, "✅ 好的，再问您几个问题就完成了", None
+        
+        # 处理固定问题（持续时间、严重程度）
+        if question:
+            field_name = question.get("field", "")
+            validated_answer = self._validate_answer(question, answer)
+            
+            if validated_answer is None:
+                return True, f"输入无效，请重新回答：{question['question']}", None
+            
+            # 存储到session
+            setattr(session, field_name, validated_answer)
+            
+            # 移动到下一个问题
+            self.current_question_index += 1
+            
+            # 检查是否完成FOLLOWUP阶段的固定问题
+            followup_questions = QUESTIONS.get(QuestionStage.FOLLOWUP, [])
+            if self.current_question_index >= len(followup_questions):
+                # 所有问题问完，进入评估
+                session.current_stage = QuestionStage.ASSESSMENT
+                return self._do_final_assessment()
+            
+            return True, None, None
+        
+        # 没有问题了，进入评估
+        session.current_stage = QuestionStage.ASSESSMENT
+        return self._do_final_assessment()
+    
+    def _check_need_followup(self) -> Tuple[bool, Optional[Dict]]:
+        """检查是否需要追问，并生成追问问题"""
+        if not self.llm:
+            return False, None
+        
+        user = self.current_user
+        session = self.current_session
+        
+        # 构建已收集信息（清晰列出每一条）
+        collected_info = []
+        if session.chief_complaint:
+            collected_info.append(f"• 主诉: {session.chief_complaint}")
+        
+        # 列出已追问的问答
+        for i, qa in enumerate(session.followup_qa, 1):
+            collected_info.append(f"• 追问{i}: {qa['question']}")
+            collected_info.append(f"  回答: {qa['answer']}")
+        
+        collected_str = "\n".join(collected_info) if collected_info else "仅有主诉，无其他信息"
+        
+        prompt = FOLLOWUP_DECISION_PROMPT.format(
+            age=int(user.age) if user.age else "未知",
+            gender=user.gender or "未知",
+            chronic_diseases=", ".join(user.chronic_diseases) if user.chronic_diseases else "无",
+            collected_info=collected_str
+        )
+        
+        try:
+            print("  🤔 [AI正在判断是否需要追问...]")
+            response = self.llm.invoke(prompt).content.strip()
+            
+            # 清理markdown
+            if "```" in response:
+                parts = response.split("```")
+                for part in parts:
+                    if "{" in part:
+                        response = part.replace("json", "").strip()
+                        break
+            
+            result = json.loads(response)
+            
+            if result.get("need_followup"):
+                question_text = result.get("question", "")
+                options = result.get("options")
+                reason = result.get("reason", "")
+                
+                if question_text:
+                    print(f"  💡 [追问原因: {reason}]")
+                    
+                    followup_q = {
+                        "question": question_text,
+                        "type": "choice" if options else "text",
+                        "field": f"followup_{session.followup_count + 1}",
+                    }
+                    if options:
+                        followup_q["options"] = options[:4]  # 最多4个选项
+                    
+                    return True, followup_q
+            
+            print("  ✅ [信息已足够，无需追问]")
+            return False, None
+            
+        except json.JSONDecodeError:
+            print("  ⚠️ AI返回格式错误，跳过追问")
+            return False, None
+        except Exception as e:
+            print(f"  ⚠️ 追问判断出错: {e}")
+            return False, None
     
     def _validate_answer(self, question: Dict, answer: str) -> Optional[any]:
         q_type = question.get("type", "text")
@@ -418,6 +621,9 @@ class StructuredConsultation:
                 if 0 <= idx < len(options):
                     return options[idx]
             if answer in options:
+                return answer
+            # 对于追问的选择题，允许自由回答
+            if question.get("field", "").startswith("followup_"):
                 return answer
             return None
         
@@ -470,7 +676,6 @@ class StructuredConsultation:
             self._save_profile(self.current_user)
         
         elif stage == QuestionStage.CONSULTATION_TYPE:
-            # 处理咨询目的选择，映射到内部值
             mapping = question.get("mapping", {}) if question else {}
             internal_value = mapping.get(value, value)
             self.current_session.consultation_type = internal_value
@@ -484,31 +689,27 @@ class StructuredConsultation:
         self.current_question_index = 0
         
         if stage == QuestionStage.BASIC_INFO:
-            # 基础信息录完，计算指标
             self._perform_health_analysis()
             self.current_session.current_stage = QuestionStage.MEDICAL_HISTORY
             return True, "基础信息已记录，正在分析您的身体状况...", None
         
         elif stage == QuestionStage.MEDICAL_HISTORY:
-            # 病史录完，进入咨询目的选择
             self.current_session.current_stage = QuestionStage.CONSULTATION_TYPE
             return True, "病史信息已记录，请选择您今天的咨询目的", None
         
         elif stage == QuestionStage.CONSULTATION_TYPE:
-            # 根据咨询目的决定下一步
             if self.current_session.consultation_type == ConsultationType.HEALTH_MANAGEMENT.value:
-                # 健康管理：跳过症状问题，直接进入评估
                 self.current_session.current_stage = QuestionStage.ASSESSMENT
                 self.current_session.risk_level = RiskLevel.LOW.value
                 self.current_session.chief_complaint = "健康管理咨询"
                 self.save_session()
                 return False, "好的，我将根据您的身体状况为您提供健康管理建议...", RiskLevel.LOW
             else:
-                # 身体不适：继续问症状
                 self.current_session.current_stage = QuestionStage.CURRENT_SYMPTOMS
                 return True, "请描述您的不适症状", None
         
         elif stage == QuestionStage.CURRENT_SYMPTOMS:
+            # 如果没有追问，直接进入评估
             self.current_session.current_stage = QuestionStage.ASSESSMENT
             return self._do_final_assessment()
         
@@ -517,14 +718,12 @@ class StructuredConsultation:
     # ==================== 健康指标计算 ====================
     
     def _perform_health_analysis(self):
-        """执行后台计算和 AI 评估"""
         user = self.current_user
         session = self.current_session
         
         if not (user.height and user.weight and user.age):
             return
         
-        # 1. 调用工具计算
         try:
             bmi_result = PURE_CALC_TOOLS["BMI"](user.height, user.weight)
             bmr_result = PURE_CALC_TOOLS["BMR"](user.weight, user.height, int(user.age), user.gender)
@@ -543,7 +742,6 @@ class StructuredConsultation:
             print(f"  ⚠️ 计算出错: {e}")
             return
         
-        # 2. 调用 LLM 进行身体状态评估
         if self.llm:
             try:
                 prompt = f"""你是一名专业健康管理师。请根据以下客观数据，用简练的语言判断该用户的身体状况。
@@ -572,7 +770,6 @@ class StructuredConsultation:
     def _assess_risk_realtime(self, text: str) -> Tuple[RiskLevel, Optional[str]]:
         text_lower = text.lower()
         
-        # 第一层：极端情况
         for keyword in EMERGENCY_KEYWORDS:
             if keyword in text_lower:
                 self.current_session.risk_keywords_found = [keyword]
@@ -590,7 +787,6 @@ class StructuredConsultation:
 """
                 return RiskLevel.CRITICAL, msg
         
-        # 第二层：调用大模型判断
         if self.llm:
             return self._llm_risk_assessment(text)
         
@@ -598,6 +794,16 @@ class StructuredConsultation:
     
     def _llm_risk_assessment(self, symptoms_text: str) -> Tuple[RiskLevel, Optional[str]]:
         user = self.current_user
+        session = self.current_session
+        
+        # 整合所有症状信息
+        all_symptoms = [symptoms_text]
+        if session.chief_complaint and session.chief_complaint != symptoms_text:
+            all_symptoms.insert(0, session.chief_complaint)
+        for qa in session.followup_qa:
+            all_symptoms.append(f"{qa['question']}: {qa['answer']}")
+        
+        symptoms_combined = "\n".join(all_symptoms)
         
         age = int(user.age) if user and user.age else "未知"
         gender = user.gender if user and user.gender else "未知"
@@ -609,14 +815,13 @@ class StructuredConsultation:
             gender=gender,
             chronic_diseases=chronic,
             allergies=allergies,
-            symptoms=symptoms_text
+            symptoms=symptoms_combined
         )
         
         try:
             print("  🤖 [AI正在分析症状严重程度...]")
             response = self.llm.invoke(prompt).content.strip()
             
-            # 清理markdown
             if "```" in response:
                 parts = response.split("```")
                 for part in parts:
@@ -676,7 +881,10 @@ class StructuredConsultation:
     def _do_final_assessment(self) -> Tuple[bool, str, RiskLevel]:
         session = self.current_session
         
-        all_text = f"{session.chief_complaint} {session.symptom_description}"
+        # 整合所有症状信息
+        all_text = session.chief_complaint or ""
+        for qa in session.followup_qa:
+            all_text += f" {qa['answer']}"
         
         found_medium = [k for k in MEDIUM_RISK_KEYWORDS if k in all_text]
         severity = float(session.symptom_severity) if session.symptom_severity else 0
@@ -701,6 +909,13 @@ class StructuredConsultation:
         if not self.current_session or not self.current_user:
             return {}
         
+        # 整合追问信息到症状描述
+        symptom_details = []
+        if self.current_session.chief_complaint:
+            symptom_details.append(f"主诉: {self.current_session.chief_complaint}")
+        for qa in self.current_session.followup_qa:
+            symptom_details.append(f"{qa['question']}: {qa['answer']}")
+        
         return {
             "user_profile": {
                 "gender": self.current_user.gender,
@@ -716,9 +931,11 @@ class StructuredConsultation:
             "consultation_type": self.current_session.consultation_type,
             "current_complaint": {
                 "chief_complaint": self.current_session.chief_complaint,
+                "symptom_details": symptom_details,  # 包含追问详情
                 "duration": self.current_session.symptom_duration,
                 "severity": self.current_session.symptom_severity,
             },
+            "followup_qa": self.current_session.followup_qa,  # 追问记录
             "risk_assessment": {
                 "level": self.current_session.risk_level,
                 "keywords": self.current_session.risk_keywords_found,
@@ -790,6 +1007,16 @@ class StructuredConsultation:
                         lines.extend([
                             f"### {session.get('start_time', sf)} [{type_label}]",
                             f"- **主诉**: {session.get('chief_complaint', '未记录')}",
+                        ])
+                        
+                        # 显示追问记录
+                        followup_qa = session.get('followup_qa', [])
+                        if followup_qa:
+                            lines.append(f"- **追问详情**:")
+                            for qa in followup_qa:
+                                lines.append(f"  - {qa['question']} → {qa['answer']}")
+                        
+                        lines.extend([
                             f"- **风险等级**: {session.get('risk_level', '未评估')}",
                             f"- **AI判断**: {session.get('llm_risk_reason', '无')}",
                             f"",
