@@ -39,8 +39,6 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
         user_id = state.get("user_id", "anonymous")
         question = messages[-1].content
         
-        print(f"\n🧭 [分析问题中...]")
-        
         # 提取健康信息（仅登录用户）
         if user_id and user_id != "anonymous":
             extract_health_info(question, user_id, llm)
@@ -50,7 +48,6 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
         
         # 检测模式
         mode = detect_mode(question)
-        print(f"  → {'健康评估' if mode == 'assessment' else '知识检索'}")
         
         return {
             "mode": mode,
@@ -66,7 +63,6 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
     
     def assessment_tool_node(state):
         """健康评估工具节点 - 调用计算工具"""
-        print("📊 [计算健康指标...]")
         question = state["messages"][-1].content
         
         response = llm_with_tools.invoke(question)
@@ -90,48 +86,61 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
     
     def retrieve_node(state):
         """本地检索节点 - 从向量库检索"""
-        print("📚 [检索知识库...]")
         question = state["messages"][-1].content
+        loop_step = state.get("loop_step", 0)
         
         search_query = f"{question} 健康建议" if state.get("tool_output") else question
-        docs = vectorstore.similarity_search(search_query, k=4)
+        docs = vectorstore.similarity_search(search_query, k=5)
         doc_contents = [d.page_content for d in docs]
         
-        return {"documents": doc_contents, "loop_step": state["loop_step"] + 1}
+        # 只在第一次检索时打印
+        if loop_step == 0 and doc_contents:
+            print(f"📚 [知识库] 检索到 {len(doc_contents)} 条相关内容")
+        
+        return {"documents": doc_contents, "loop_step": loop_step + 1}
     
     def web_search_node(state):
         """Web搜索节点 - 联网搜索"""
-        print("🌐 [联网搜索...]")
         question = state["messages"][-1].content
         
         # 检查工具是否可用
         if web_search_tool is None:
-            print("  ⚠️ 联网搜索未配置")
-            return {"documents": ["⚠️ 联网搜索未配置，请设置 TAVILY_API_KEY"], "used_web_search": True}
+            return {"documents": [], "used_web_search": True}
         
         try:
             results = web_search_tool.invoke(question)
             
             # 处理不同的返回格式
             web_contents = []
-            if isinstance(results, list):
+            
+            # Tavily 可能返回字符串、列表或其他格式
+            if isinstance(results, str):
+                # 如果是单个字符串，直接添加
+                if results.strip():
+                    web_contents.append(results)
+            elif isinstance(results, list):
                 for res in results:
                     if isinstance(res, dict):
-                        content = res.get('content') or res.get('snippet') or str(res)
-                        web_contents.append(content)
-                    else:
-                        web_contents.append(str(res))
-            elif isinstance(results, str):
-                web_contents = [results]
-            else:
-                web_contents = [str(results)]
+                        # 尝试获取内容字段
+                        content = res.get('content') or res.get('snippet') or res.get('text') or ""
+                        if content:
+                            web_contents.append(content)
+                    elif isinstance(res, str) and res.strip():
+                        web_contents.append(res)
+            elif hasattr(results, 'content'):
+                # 如果是对象，尝试获取content属性
+                if results.content:
+                    web_contents.append(str(results.content))
             
             if web_contents:
-                print(f"  ✅ 找到 {len(web_contents)} 条结果")
+                print(f"🌐 [联网搜索] 找到 {len(web_contents)} 条结果")
+            else:
+                print("🌐 [联网搜索] 未找到相关结果")
+                
             return {"documents": web_contents, "used_web_search": True}
         except Exception as e:
-            print(f"  ❌ 搜索出错: {e}")
-            return {"documents": [f"⚠️ 网络搜索出错: {str(e)}"], "used_web_search": True}
+            print(f"🌐 [联网搜索] 出错: {e}")
+            return {"documents": [], "used_web_search": True}
     
     def grade_and_generate_node(state):
         """评分与生成节点 - 评估文档并生成回答"""
@@ -143,7 +152,7 @@ def create_nodes(llm, llm_with_tools, vectorstore, web_search_tool, medical_tool
         score = grade_documents(question, docs, llm)
         
         if score == "yes":
-            print("💡 [生成回答...]")
+            print("💡 [正在生成建议...]")
             context = "\n\n".join(docs)
             source_tag = "(来源: 互联网)" if state["used_web_search"] else "(来源: 医学知识库)"
             
