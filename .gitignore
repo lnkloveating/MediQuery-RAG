@@ -18,3 +18,9 @@ medical_db/
 user_data/
 user_profiles/
 hitl_reviews/
+
+# 忽略 data 文件夹下的所有内容
+data/*
+
+# 但是！不忽略 .gitkeep 文件（为了保留文件夹结构）
+!data/.gitkeep
