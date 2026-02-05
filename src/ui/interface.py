@@ -187,6 +187,7 @@ def run_health_advisor(app, llm=None) -> str:
         QuestionStage.MEDICAL_HISTORY: "📋 病史信息采集", 
         QuestionStage.CONSULTATION_TYPE: "🎯 咨询目的选择",
         QuestionStage.CURRENT_SYMPTOMS: "🩺 症状描述",
+        QuestionStage.FOLLOWUP: "🔍 深入了解",
     }
     
     current_stage = None
@@ -416,6 +417,21 @@ def _build_rag_query(summary: dict) -> str:
     complaint = summary.get("current_complaint", {})
     chief = complaint.get("chief_complaint", "")
     
+    # 获取追问详情
+    symptom_details = complaint.get("symptom_details", [])
+    followup_qa = summary.get("followup_qa", [])
+    
+    # 构建详细症状描述
+    symptom_desc_parts = []
+    if chief:
+        symptom_desc_parts.append(f"主诉：{chief}")
+    if followup_qa:
+        symptom_desc_parts.append("详细信息：")
+        for qa in followup_qa:
+            symptom_desc_parts.append(f"  - {qa['question']} → {qa['answer']}")
+    
+    symptom_desc = "\n".join(symptom_desc_parts) if symptom_desc_parts else chief
+    
     if consultation_type == "health_management":
         # 健康管理建议模式
         query = f"""
@@ -443,14 +459,14 @@ def _build_rag_query(summary: dict) -> str:
 {context}。
 
 【症状描述】
-主诉：{chief}
+{symptom_desc}
 持续时间：{complaint.get('duration', '未知')}
 严重程度：{complaint.get('severity', '未知')}/10分
 
 【咨询需求】
-请针对患者的症状「{chief}」提供健康建议：
+请针对患者的症状提供健康建议：
 
-1. 可能的原因分析
+1. 根据以上详细信息，分析可能的原因
 2. 日常调理和注意事项
 3. 饮食和作息建议
 4. 什么情况下需要就医
@@ -458,7 +474,8 @@ def _build_rag_query(summary: dict) -> str:
 【重要提示】
 - 这是健康科普咨询，不是诊断，请直接给出建议
 - 不需要计算BMI等指标，患者信息已经提供
-- 请用通俗易懂的语言，给出实用的建议
+- 请结合追问收集到的详细信息，给出针对性建议
+- 用通俗易懂的语言
 """
     
     return query
